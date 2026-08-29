@@ -5,6 +5,7 @@ config.yaml
 # runtime output / 运行时输出
 logs/
 *.log
+*.old
 
 # python
 __pycache__/
