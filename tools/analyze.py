@@ -22,6 +22,7 @@ import csv
 import math
 import sys
 import time
+from datetime import datetime, timezone
 
 CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 
@@ -38,7 +39,7 @@ def pctl(sorted_vals: list, q: float) -> float:
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
 
 
-def load_rows(path: str, hours: float, min_samples: int) -> list:
+def load_rows(path: str, hours: float) -> list:
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
     rows = []
     with open(path, newline="") as fh:
@@ -46,10 +47,9 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
             try:
                 if float(r["minute_ts"]) < cutoff:
                     continue
-                if int(r["samples"]) < min_samples:
-                    continue
                 rows.append({
                     "ts": float(r["minute_ts"]),
+                    "samples": int(r["samples"]),
                     "prem": float(r["premium_close_bps"]),
                     "prem_mean": float(r["premium_mean_bps"]),
                     "sell_max": float(r["sell_edge_max_bps"]),
@@ -58,6 +58,30 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
             except (KeyError, ValueError):
                 continue
     return rows
+
+
+def is_us_session(ts: float) -> bool:
+    """US equity cash hours, 13:30-20:00 UTC Mon-Fri."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if dt.weekday() >= 5:
+        return False
+    mins = dt.hour * 60 + dt.minute
+    return 13 * 60 + 30 <= mins < 20 * 60
+
+
+def _stats_block(label: str, subset: list, fees: float, midline: float) -> None:
+    if len(subset) < 10:
+        print(f"  {label}: <10 minutes, skipped")
+        return
+    prem = sorted(r["prem"] for r in subset)
+    med = pctl(prem, 50)
+    mean = sum(prem) / len(prem)
+    var = sum((x - mean) ** 2 for x in prem) / len(prem)
+    s90 = pctl(sorted(r["sell_max"] - midline - fees for r in subset), 90)
+    b90 = pctl(sorted(r["buy_max"] + midline - fees for r in subset), 90)
+    print(f"  {label}: n={len(subset):>5}  median {med:+.2f}  "
+          f"std {math.sqrt(var):.2f}  | p90 room: sell {max(s90, 0.0):.1f} / "
+          f"buy {max(b90, 0.0):.1f} bps")
 
 
 def main() -> None:
@@ -76,12 +100,13 @@ def main() -> None:
     args = p.parse_args()
 
     try:
-        rows = load_rows(args.csv, args.hours, args.min_samples)
+        all_rows = load_rows(args.csv, args.hours)
     except FileNotFoundError:
         print(f"{args.csv} not found — run the bot (even --record-only) to "
               f"collect data first / 未找到数据文件，请先运行机器人采集数据",
               file=sys.stderr)
         sys.exit(1)
+    rows = [r for r in all_rows if r["samples"] >= args.min_samples]
     if len(rows) < 30:
         print(f"only {len(rows)} usable minute(s) in {args.csv} — collect at "
               f"least a few hours before trusting the numbers / 数据太少，"
@@ -95,13 +120,21 @@ def main() -> None:
     var = sum((x - mean) ** 2 for x in prem) / len(prem)
     median = pctl(prem, 50)
 
-    print(f"\n=== {args.csv}: {len(rows)} minutes over {span_h:.1f}h ===\n")
+    print(f"\n=== {args.csv}: {len(rows)} usable minutes over {span_h:.1f}h "
+          f"===\n")
     print("premium of Entropy over hedge, minute close (bps) / "
           "Entropy 相对对冲腿的溢价:")
     print(f"  mean {mean:+.2f}   std {math.sqrt(var):.2f}   "
           f"median {median:+.2f}")
     print(f"  p5 {pctl(prem, 5):+.2f}   p25 {pctl(prem, 25):+.2f}   "
           f"p75 {pctl(prem, 75):+.2f}   p95 {pctl(prem, 95):+.2f}")
+
+    # ---- coverage (v2): how complete is the recording
+    n = len(all_rows)
+    cov30 = sum(1 for r in all_rows if r["samples"] >= 30) / n * 100 if n else 0
+    full = sum(1 for r in all_rows if r["samples"] == 60) / n * 100 if n else 0
+    print(f"\ncoverage / 采集完整度: >=30s {cov30:.0f}%   full-minute "
+          f"{full:.0f}%   (skipped {n - len(rows)} low-sample minutes)")
 
     midline = round(median, 1) or 0.0   # normalize -0.0
     # room beyond the midline that was actually executable each minute, net
@@ -112,6 +145,24 @@ def main() -> None:
                        reverse=True)
     buy_room = sorted((r["buy_max"] + midline - fees for r in rows),
                       reverse=True)
+
+    # ---- drift table (v2): 6h buckets
+    print("\npremium median per 6h window / 每6小时溢价中枢:")
+    buckets: dict = {}
+    for r in rows:
+        buckets.setdefault(int(r["ts"] // 21600), []).append(r["prem"])
+    for b in sorted(buckets)[-12:]:
+        vals = sorted(buckets[b])
+        t0 = datetime.fromtimestamp(b * 21600, tz=timezone.utc)
+        print(f"  {t0:%m-%d %H}:00Z  median {pctl(vals, 50):+.2f}  "
+              f"n={len(vals)}")
+
+    # ---- session split (v2): US equity hours vs off-hours
+    print("\nby session / 分时段（美股现金时段 13:30-20:00 UTC 周一至周五）:")
+    _stats_block("US hours ", [r for r in rows if is_us_session(r["ts"])],
+                 fees, midline)
+    _stats_block("off-hours", [r for r in rows if not is_us_session(r["ts"])],
+                 fees, midline)
 
     print(f"\nwith midline_bps = {midline:+.1f} (median) and {fees:.1f} bps "
           f"round-trip taker fees, minutes each band would have fired / "
