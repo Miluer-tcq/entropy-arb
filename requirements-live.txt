@@ -11,4 +11,4 @@ eth-account>=0.10
 # known-good commit: ...lighter-python.git@<commit-sha>
 # 仅当 --hedge 为 lighter / lighter-rh 时需要。默认安装 SDK 最新主分支；
 # 如需可复现部署，可在末尾固定 commit：...lighter-python.git@<commit-sha>
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@ebc50660efc99f31e4055418e4514255456cb060
