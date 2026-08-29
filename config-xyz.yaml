@@ -1,0 +1,109 @@
+﻿# entropy-arb strategy configuration / 策略配置
+#
+#   cp config.example.yaml config.yaml     then edit / 复制后修改
+#
+# This file IS the strategy. Credentials never live here — they go in .env
+# (see .env.example). Every key is validated: a typo is a startup error, not
+# a setting that silently does nothing.
+# 本文件就是策略本身。密钥绝不放在这里（见 .env.example）。所有键名都会被校验：
+# 拼写错误会直接报错，而不是静默失效。
+#
+# WHICH MARKETS to trade is NOT in this file — you state it explicitly on
+# every start with command-line flags:
+#     python3 main.py --symbol SNDK --hedge lighter-rh
+# Entropy is always one leg; --hedge picks the other:
+#   lighter      Lighter mainnet            (USDC, 0 bps taker)
+#   lighter-rh   Lighter Robinhood chain    (USDG, 0 bps taker)
+#   tradexyz     Hyperliquid trade.xyz dex  (USDC, ~1 bps taker)
+# 交易哪个市场不在本文件中配置——每次启动时用命令行参数显式指定：
+#     python3 main.py --symbol SNDK --hedge lighter-rh
+# Entropy 永远是其中一条腿；--hedge 选择对冲腿（三选一，见上表）。
+
+# ============================ THE SIGNAL / 信号 ============================
+# premium_bps = (Entropy price / hedge price - 1) * 10000
+#
+#   SELL entropy + BUY hedge   when executable premium >= midline + upper
+#   BUY entropy + SELL hedge   when executable premium <= midline - lower
+#
+# Both hurdles are net of taker fees (the engine adds fees on top), so one
+# full round trip nets >= upper + lower bps after fees by construction.
+#
+# midline_bps is a number YOU derive from recorded data. Run the bot
+# (--record-only) to collect logs/minutes.csv, then:  python3 tools/analyze.py
+#
+# midline_bps 是你根据采集数据设定的值。先运行机器人（--record-only）采集
+# logs/minutes.csv，再运行 python3 tools/analyze.py 获取建议值。
+# 两个方向的门槛都已扣除手续费（引擎会在此之上另加手续费），因此一次完整往返
+# 扣费后净赚 >= upper + lower bps。
+thresholds:
+  midline_bps: 0.0     # persistent premium center / 溢价长期中枢
+  upper_bps: 4.0       # entry above midline: sell entropy / 中枢上方入场带宽
+  lower_bps: 4.0       # entry below midline: buy entropy / 中枢下方入场带宽
+
+# ======================== VENUES / 交易所参数 ==============================
+entropy:
+  dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
+  taker_fee_bps: 0.0         # taker fee / 吃单手续费
+  max_position_usd: 1000     # position cap / 持仓上限（美元）
+  max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
+
+hedge:
+  taker_fee_bps: 1.0         # Lighter venues: 0; tradexyz: ~1.0
+  max_position_usd: 1000
+  max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
+
+# ========================= SIZING / 下单规模 ===============================
+sizing:
+  take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
+  max_order_notional_usd: 500  # per-slice cap / 单笔名义上限
+  min_order_notional_usd: 10   # skip dust / 低于此名义不下单
+
+# ==================== INVENTORY LADDER / 库存阶梯 ==========================
+# Extra bps required once a venue's position passes floor_frac of its cap in
+# the adding direction — ramps linearly to scale_bps at 100% of the cap.
+# Slows down one-sided accumulation without hard-stopping the strategy.
+# 当某交易所持仓超过上限的 floor_frac 后，同方向继续加仓需额外溢价，线性增加到
+# 满仓时的 scale_bps。避免单边持仓快速堆满。 scale_bps: 0 disables / 0 为关闭。
+inventory:
+  scale_bps: 10.0
+  floor_frac: 0
+
+# ======================= EXECUTION / 执行参数 ==============================
+execution:
+  premium_persist_sec: 0     # edge must persist this long before firing / 信号需持续时间
+  cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
+  settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
+  leg_slippage_bps: 50.0       # taker limit protection per leg / 每腿滑点保护
+  hedge_slippage_bps: 20.0     # price protection on delta hedges / 对冲滑点保护
+  net_tolerance_base: 0.001    # max tolerated net delta (base units) / 允许的净敞口
+  max_consecutive_errors: 3    # halt after N straight failures / 连续失败 N 次后停机
+  rate_limit_pause_sec: 10.0   # pause a 429'd venue this long / 被限频后的暂停时长
+  staleness_sec: 10.0          # a feed older than this is stale / 行情超时判定
+  reconcile_sec: 15.0          # on-chain position sync cadence / 链上持仓核对周期
+  venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
+  http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+
+# ================== DATA RECORDER / 数据采集 ===============================
+# Always-on while the bot runs: samples both real order books 1/sec and
+# writes one CSV row per minute. This is the input for tools/analyze.py.
+# 机器人运行期间自动开启：每秒采样两边真实盘口，每分钟写一行 CSV，
+# 供 tools/analyze.py 分析并设定上方 thresholds。
+recorder:
+  enabled: true
+  csv: logs/xyz_minutes.csv
+
+# ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
+# On a terminal the bot shows a live Rich dashboard (books, signal, positions,
+# PnL, recent executions); log lines then go to `file` instead of the console.
+# Off-terminal runs (nohup/systemd) fall back to plain console logs
+# automatically; --no-dashboard forces that.
+# 在终端运行时显示实时 Rich 仪表盘（盘口、信号、持仓、盈亏、最近成交），
+# 日志写入 `file` 而不再打印到屏幕。非终端环境（nohup/systemd）自动退回
+# 纯日志模式；也可用 --no-dashboard 强制关闭。
+logging:
+  level: INFO
+  status_interval_sec: 30.0
+  trades_csv: logs/xyz_trades.csv
+  dashboard: true
+  file: logs/xyz_engine.log
+
