@@ -292,10 +292,12 @@ class HLVenue:
 
     async def fetch_equity(self):
         """Unified account equity via the portfolio endpoint — the same
-        Portfolio Value the HL UI shows. Falls back to summing clearinghouse
-        buckets if the endpoint shape changes. When both venues share one HL
-        account (include_core_equity cleared on the hedge), that venue reports
-        only its dex bucket to avoid double-counting."""
+        Portfolio Value the HL UI shows. "Free" is the withdrawable balance
+        of this venue's dex bucket (isolated margin actually backing the
+        bot's positions). Falls back to summing clearinghouse buckets if the
+        endpoint shape changes. When both venues share one HL account
+        (include_core_equity cleared on the hedge), that venue reports only
+        its dex bucket to avoid double-counting."""
         addr = self._query_address()
         if addr is None:
             return None
@@ -306,7 +308,8 @@ class HLVenue:
                     if period == "day":
                         hist = d.get("accountValueHistory") or []
                         if hist:
-                            return float(hist[-1][1]), None
+                            return (float(hist[-1][1]),
+                                    await self._dex_withdrawable(addr))
             except Exception as e:
                 log.debug("[%s] portfolio fetch failed, falling back: %r",
                           self.name, e)
@@ -319,6 +322,17 @@ class HLVenue:
             eq += float(ms.get("accountValue") or 0.0)
             fr += float(st.get("withdrawable") or 0.0)
         return eq, fr
+
+    async def _dex_withdrawable(self, addr: str) -> Optional[float]:
+        """Withdrawable balance of this venue's dex bucket (isolated margin
+        free to use); None when the API call fails."""
+        try:
+            st = await self._info({"type": "clearinghouseState", "user": addr,
+                                   "dex": self.conf.hl_dex})
+            return float(st.get("withdrawable") or 0.0)
+        except Exception as e:
+            log.debug("[%s] withdrawable fetch failed: %r", self.name, e)
+            return None
 
     async def fetch_position(self) -> float:
         addr = self._query_address()
