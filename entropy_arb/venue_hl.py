@@ -89,6 +89,7 @@ class HLVenue:
         self.min_quote = 10.0
         self._cloid = int(time.time() * 1000)
         self._signing = None      # lazy hyperliquid-sdk signing module
+        self._unified: Optional[bool] = None  # cached userAbstraction state
 
     async def _info(self, payload: dict):
         async with self.session.post(
@@ -298,7 +299,12 @@ class HLVenue:
         bot's positions). Falls back to summing clearinghouse buckets if the
         endpoint shape changes. When both venues share one HL account
         (include_core_equity cleared on the hedge), that venue reports only
-        its dex bucket to avoid double-counting."""
+        its dex bucket to avoid double-counting.
+
+        Under the "unifiedAccount" abstraction (HIP-3 builder dexes draw
+        margin straight from spot USDC), free margin additionally includes
+        the account's free spot USDC — otherwise a funded spot and empty dex
+        buckets would show as $0 free despite orders being accepted."""
         addr = self._query_address()
         if addr is None:
             return None
@@ -309,8 +315,10 @@ class HLVenue:
                     if period == "day":
                         hist = d.get("accountValueHistory") or []
                         if hist:
-                            return (float(hist[-1][1]),
-                                    await self._dex_withdrawable(addr))
+                            free = await self._dex_withdrawable(addr)
+                            if await self._is_unified(addr):
+                                free += await self._spot_usdc_free(addr)
+                            return (float(hist[-1][1]), free)
             except Exception as e:
                 log.debug("[%s] portfolio fetch failed, falling back: %r",
                           self.name, e)
@@ -322,7 +330,43 @@ class HLVenue:
             ms = st.get("marginSummary") or {}
             eq += float(ms.get("accountValue") or 0.0)
             fr += float(st.get("withdrawable") or 0.0)
+        if self.include_core_equity and await self._is_unified(addr):
+            fr += await self._spot_usdc_free(addr)
         return eq, fr
+
+    @staticmethod
+    def spot_usdc_free(balances: list) -> float:
+        """Free USDC in the spot account: total minus open-order holds."""
+        for b in balances or []:
+            if b.get("coin") == "USDC":
+                try:
+                    return max(float(b.get("total") or 0.0)
+                               - float(b.get("hold") or 0.0), 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    async def _spot_usdc_free(self, addr: str) -> float:
+        try:
+            st = await self._info({"type": "spotClearinghouseState",
+                                   "user": addr})
+            return self.spot_usdc_free(st.get("balances") or [])
+        except Exception as e:
+            log.debug("[%s] spot balance fetch failed: %r", self.name, e)
+            return 0.0
+
+    async def _is_unified(self, addr: str) -> bool:
+        """True when the account uses the "unifiedAccount" abstraction
+        (spot USDC directly backs perp dex orders). Cached — restart to
+        pick up a changed abstraction level."""
+        if self._unified is None:
+            try:
+                r = await self._info({"type": "userAbstraction", "user": addr})
+                self._unified = r == "unifiedAccount"
+            except Exception as e:
+                log.debug("[%s] abstraction lookup failed: %r", self.name, e)
+                self._unified = False
+        return self._unified
 
     async def _dex_withdrawable(self, addr: str) -> Optional[float]:
         """Withdrawable balance of this venue's dex bucket (isolated margin

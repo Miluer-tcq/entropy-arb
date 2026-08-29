@@ -158,7 +158,27 @@ async def run_preflight(cfg: Config) -> bool:
                                   timeout=t10) as r:
                     st = await r.json()
                 free = float(st.get("withdrawable") or 0.0)
-                _margin_check(c, "entropy margin (io dex)", free, cfg)
+                # unifiedAccount abstraction: spot USDC directly backs
+                # builder-dex orders, so count free spot USDC as margin.
+                async with s.post(cfg.hl_api_url + "/info",
+                                  json={"type": "userAbstraction",
+                                        "user": addr},
+                                  timeout=t10) as r:
+                    unified = await r.json() == "unifiedAccount"
+                if unified:
+                    async with s.post(cfg.hl_api_url + "/info",
+                                      json={"type": "spotClearinghouseState",
+                                            "user": addr},
+                                      timeout=t10) as r:
+                        sp = await r.json()
+                    for b in sp.get("balances") or []:
+                        if b.get("coin") == "USDC":
+                            free += max(float(b.get("total") or 0.0)
+                                        - float(b.get("hold") or 0.0), 0.0)
+                            break
+                label = ("entropy margin (io dex, unified spot)"
+                         if unified else "entropy margin (io dex)")
+                _margin_check(c, label, free, cfg)
             except Exception as e:
                 c.fail("entropy balance lookup", repr(e))
 
