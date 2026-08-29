@@ -20,12 +20,14 @@ import logging
 import os
 import time
 from collections import deque
+from datetime import datetime, time as dtime, timezone
 from typing import Dict, List, Optional
 
 import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
+from .monitor import drift_report
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -85,6 +87,12 @@ class Engine:
         self._venue_fetch_fails: Dict[str, int] = {}
         # per-execution records for the dashboard (newest last)
         self.recent_trades: deque = deque(maxlen=50)
+        # watch state — observability (fees/funding/drift); auto_midline is
+        # opt-in and clamped, everything else never affects order flow
+        self.midline = cfg.midline_bps
+        self.funding: Dict[str, Optional[float]] = {}
+        self.drift: Dict[str, Optional[float]] = {"median": None,
+                                                  "drift": None, "n": 0}
 
     # ------------------------------------------------------------- utilities
 
@@ -161,6 +169,21 @@ class Engine:
                 and self.entropy._query_address() == self.hedge._query_address()):
             self.hedge.include_core_equity = False  # shared account: count once
 
+        for v in self.venues.values():
+            getter = getattr(v, "fetch_fee", None)
+            if getter is None:
+                continue
+            try:
+                fee = await getter()
+            except Exception as e:
+                log.debug("[%s] fee fetch failed: %r", v.name, e)
+                continue
+            if fee is not None and abs(fee - v.fee_bps) > 1e-9:
+                log.info("[%s] taker fee %.2fbps (config %.2f) — using the "
+                         "exchange value", v.name, fee, v.fee_bps)
+                v.fee_bps = fee
+                v.fee_src = "exchange"
+
         self._step = 10 ** -min(self.entropy.size_decimals,
                                 self.hedge.size_decimals)
         self._min_base = max(self.entropy.min_base, self.hedge.min_base,
@@ -202,6 +225,7 @@ class Engine:
             tasks.append(asyncio.create_task(self._http_keepalive_loop(),
                                              name="keepalive"))
         tasks.append(asyncio.create_task(self._status_loop(), name="status"))
+        tasks.append(asyncio.create_task(self._watch_loop(), name="watch"))
         if live:
             tasks.append(asyncio.create_task(self._reconcile_loop(),
                                              name="reconcile"))
@@ -246,15 +270,31 @@ class Engine:
 
         return max(ramp(buy, buy.position >= 0), ramp(sell, sell.position <= 0))
 
+    def _band(self) -> tuple:
+        """Effective (upper_bps, lower_bps). The optional by_session block
+        replaces the global band while inside its UTC window."""
+        cfg = self.cfg
+        if cfg.session_upper_bps is None:
+            return cfg.upper_bps, cfg.lower_bps
+        now = datetime.now(timezone.utc).time()
+        start = dtime.fromisoformat(cfg.session_start_utc)
+        end = dtime.fromisoformat(cfg.session_end_utc)
+        inside = (start <= now < end if start < end
+                  else (now >= start or now < end))
+        if inside:
+            return cfg.session_upper_bps, cfg.session_lower_bps
+        return cfg.upper_bps, cfg.lower_bps
+
     def _eff_threshold(self, buy, sell) -> float:
         """Net hurdle (bps, on top of fees) for the direction buy->sell.
 
         selling entropy: executable premium must clear midline + upper;
         buying entropy: the reverse premium must clear lower - midline."""
+        up, lo = self._band()
         if sell.key == "entropy":
-            base = self.cfg.midline_bps + self.cfg.upper_bps
+            base = self.midline + up
         else:
-            base = self.cfg.lower_bps - self.cfg.midline_bps
+            base = lo - self.midline
         return base + self._inv_add_bps(buy, sell)
 
     def _headroom(self, buy, sell, ref_px: float) -> float:
@@ -718,6 +758,51 @@ class Engine:
             return None
         return (em / hm - 1.0) * 1e4
 
+    WATCH_INTERVAL_SEC = 60.0
+    AUTO_MIDLINE_CLAMP_BPS = 3.0
+
+    async def _watch_loop(self) -> None:
+        """Observability loop: funding rates + midline drift, refreshed once
+        a minute. Purely informational except auto_midline (opt-in), which
+        moves the effective midline inside a clamp around the configured
+        value and logs every change."""
+        while not self.stop.is_set():
+            try:
+                await self._watch_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("watch tick failed")
+            try:
+                await asyncio.wait_for(self.stop.wait(),
+                                       timeout=self.WATCH_INTERVAL_SEC)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _watch_tick(self) -> None:
+        for v in self.venues.values():
+            getter = getattr(v, "fetch_funding", None)
+            if getter is None:
+                continue
+            try:
+                self.funding[v.key] = await getter()
+            except Exception as e:
+                log.debug("[%s] funding fetch failed: %r", v.name, e)
+        if not self.cfg.recorder_enabled:
+            return
+        rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps, 24.0)
+        self.drift = rep
+        if rep["drift"] is not None and self.cfg.auto_midline:
+            clamped = min(max(rep["median"],
+                              self.cfg.midline_bps - self.AUTO_MIDLINE_CLAMP_BPS),
+                          self.cfg.midline_bps + self.AUTO_MIDLINE_CLAMP_BPS)
+            if abs(clamped - self.midline) > 1e-9:
+                log.warning("midline auto-adjust %+.2f -> %+.2f bps (24h "
+                            "rolling median %+.2f, clamp ±%.1f bps)",
+                            self.midline, clamped, rep["median"],
+                            self.AUTO_MIDLINE_CLAMP_BPS)
+                self.midline = clamped
+
     async def _status_loop(self) -> None:
         cfg = self.cfg
         while not self.stop.is_set():
@@ -739,12 +824,12 @@ class Engine:
             pnl = self.session_pnl()
             rec = (f" | rec {self.recorder.rows_written} rows"
                    if self.recorder else "")
+            up, lo = self._band()
             log.info("[status] %s | prem %s bps (band %+.2f..%+.2f) | pos %s "
                      "net %+.6g | trades %d hedges %d | MTM %s expEdge $%.4f "
                      "fillEdge $%.4f%s%s",
-                     books, prem_s, cfg.midline_bps - cfg.lower_bps,
-                     cfg.midline_bps + cfg.upper_bps, pos, net, self.trades,
-                     self.hedges,
+                     books, prem_s, self.midline - lo, self.midline + up,
+                     pos, net, self.trades, self.hedges,
                      f"${pnl:+.4f}" if pnl is not None else "—",
                      self.total_exp_edge, self.total_fill_edge, rec,
                      " *** HALTED ***" if self.halted else "")
@@ -771,7 +856,7 @@ class Engine:
                             f"{plan.buy_notional:.2f}", f"{plan.sell_notional:.2f}",
                             f"{plan.exp_edge_usd:.4f}", f"{plan.gross_edge_usd:.4f}",
                             f"{plan.marginal_premium_bps:.3f}",
-                            f"{self.cfg.midline_bps:.3f}",
+                            f"{self.midline:.3f}",
                             f"{inv_bps:.3f}", int(ok), f"{bfill:.8g}",
                             f"{sfill:.8g}", bstatus, sstatus, f"{fill_edge:.4f}"])
         except Exception:
