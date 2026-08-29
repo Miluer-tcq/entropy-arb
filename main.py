@@ -57,7 +57,10 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
     eng = Engine(cfg, record_only=record_only)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, eng.request_stop)
+        try:
+            loop.add_signal_handler(sig, eng.request_stop)
+        except NotImplementedError:
+            pass
     if not use_dashboard:
         await eng.run()
         return
