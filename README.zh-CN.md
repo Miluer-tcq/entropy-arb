@@ -1,4 +1,4 @@
-# entropy-arb
+﻿# entropy-arb
 
 **[English documentation / 英文文档 → README.md](README.md)**
 
@@ -12,9 +12,23 @@
 | `tradexyz` | Hyperliquid trade.xyz dex | USDC | ~1 bps | HL l2Book，IOC 同步结算 |
 
 > **推荐链接** —— 通过以下链接注册即可支持本项目：
-> - Entropy — Tier 4 推荐，100% 返佣：<https://entropy.io/?r=yourquantguy>
-> - Lighter Robinhood 链：<https://robinhoodchain.lighter.xyz/?referral=QUANT>
-> - trade.xyz（Hyperliquid）：<https://app.hyperliquid.xyz/join/QUANTGUY>
+> - Entropy — Tier 4 推荐，100% 返佣：<https://entropy.io/?r=miluer>
+> - Lighter：<https://app.lighter.xyz/?referral=MILUER&source=none>
+
+## 本 Fork 的改进
+
+- **单实例锁** —— 重复启动会干净退出；崩溃残留的锁文件可自动识别并恢复（兼容 Windows）。
+- **`--preflight` 启动预检** —— 密钥、市场状态、保证金与上限（支持 Hyperliquid
+  **unifiedAccount**：spot 里的 USDC 直接计为可用保证金）、交易所实价手续费、
+  采集数据新鲜度与中枢漂移，共 12 项检查。
+- **分时段阈值** —— `by_session` 支持盘中独立中枢与带宽（如美股时段放宽带、
+  中枢下移），周末自动回退全局带。
+- **手续费/资金费率自动发现** —— 运行时从交易所拉取实际费率（配置值仅作兜底），TUI 可见。
+- **TUI 仪表盘** —— 任意终端高度精确铺满无空白、超长日志换行不截断、会话栏实时显示
+  交易时段与 1 小时中枢偏移（`--cn` 切换中文）。
+- **数据工具链** —— 分钟级采集器、分时段分析器（`tools/analyze.py`）、带宽回测器、
+  漂移监控模块，48 个 pytest 用例全覆盖。
+- **Windows 启动器** —— `run-live.ps1`：预检通过才启动 + 崩溃自动重启，退出码干净传递。
 
 当同一品种在一边贵、另一边便宜时，机器人同时在贵的一边卖出、便宜的一边买入
 （均为吃单），持有 delta 中性仓位，等溢价回归后反向平仓。所有交易决策使用的
@@ -61,7 +75,7 @@ midline − lower  ────────────────────�
 ## 快速开始
 
 ```bash
-git clone https://github.com/your-quantguy/entropy-arb.git && cd entropy-arb
+git clone https://github.com/Miluer-tcq/entropy-arb.git && cd entropy-arb
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # 数据采集只需要这些
 

@@ -1,4 +1,4 @@
-# entropy-arb
+﻿# entropy-arb
 
 **[中文文档 / Chinese documentation → README.zh-CN.md](README.zh-CN.md)**
 
@@ -12,9 +12,29 @@ Open-source two-venue perp arbitrage bot. One leg is always **Entropy**
 | `tradexyz` | Hyperliquid trade.xyz dex | USDC | ~1 bps | HL l2Book, sync IOC settle |
 
 > **Referral links** — signing up through these supports this project:
-> - Entropy — Tier 4 referral, 100% rebates: <https://entropy.io/?r=yourquantguy>
-> - Lighter Robinhood chain: <https://robinhoodchain.lighter.xyz/?referral=QUANT>
-> - trade.xyz (Hyperliquid): <https://app.hyperliquid.xyz/join/QUANTGUY>
+> - Entropy — Tier 4 referral, 100% rebates: <https://entropy.io/?r=miluer>
+> - Lighter: <https://app.lighter.xyz/?referral=MILUER&source=none>
+
+## What this fork adds
+
+- **Single-instance lock** — a second live start exits cleanly; stale lock
+  files from crashes are detected and recovered (Windows-safe).
+- **`--preflight` go/no-go startup check** — keys, market status, margin vs
+  caps (incl. Hyperliquid **unifiedAccount**: free spot USDC counts),
+  auto-discovered taker fees, recorder freshness and midline drift.
+- **Session-aware thresholds** — `by_session` with an optional per-session
+  `midline_bps` (e.g. wider band + lower center during US hours), weekends
+  automatically fall back to the global band.
+- **Auto fees & funding** — taker fee and funding rate are pulled from each
+  exchange at runtime (config value only as fallback), shown in the TUI.
+- **TUI dashboard** — exact terminal fill at any height, CJK-safe log
+  wrapping, session panel with live trading-session tag and 1h midline
+  drift (English / 中文 via `--cn`).
+- **Data tooling** — 1-minute recorder, session-split analyzer
+  (`tools/analyze.py`), band backtester, drift monitor module — all tested
+  (48 pytest cases).
+- **Windows wrapper** — `run-live.ps1`: preflight-gated start + auto-restart
+  with clean exit-code handling.
 
 When the same symbol trades rich on one venue and cheap on the other, the bot
 simultaneously sells the rich book and buys the cheap book with taker orders,
@@ -68,7 +88,7 @@ that is what the recorder and analyzer are for.
 ## Quick start
 
 ```bash
-git clone https://github.com/your-quantguy/entropy-arb.git && cd entropy-arb
+git clone https://github.com/Miluer-tcq/entropy-arb.git && cd entropy-arb
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # data collection needs only this
 
