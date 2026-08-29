@@ -133,6 +133,12 @@ class Config:
     trades_csv: str
     dashboard: bool
     log_file: str
+    # watch / auto-tuning (all opt-in; defaults keep upstream behaviour)
+    auto_midline: bool = False
+    session_upper_bps: Optional[float] = None
+    session_lower_bps: Optional[float] = None
+    session_start_utc: Optional[str] = None
+    session_end_utc: Optional[str] = None
     # runtime
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
@@ -156,6 +162,13 @@ _SCHEMA: Dict[str, Any] = {
         "midline_bps": float,
         "upper_bps": float,
         "lower_bps": float,
+        "auto_midline": bool,
+        "by_session": {
+            "start_utc": str,
+            "end_utc": str,
+            "upper_bps": float,
+            "lower_bps": float,
+        },
     },
     "entropy": {
         "dex": str,
@@ -285,6 +298,30 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("thresholds.upper_bps and lower_bps must be > 0 "
                           "(the round trip nets upper+lower bps after fees)")
 
+    auto_midline = bool(thr.get("auto_midline", False))
+    sess = thr.get("by_session") or None
+    sess_start = sess_end = None
+    sess_upper = sess_lower = None
+    if sess is not None:
+        for k in ("start_utc", "end_utc", "upper_bps", "lower_bps"):
+            if k not in sess:
+                raise ConfigError(f"'thresholds.by_session.{k}' is required "
+                                  f"when by_session is configured")
+        sess_start, sess_end = sess["start_utc"], sess["end_utc"]
+        sess_upper, sess_lower = float(sess["upper_bps"]), float(sess["lower_bps"])
+        if sess_upper <= 0 or sess_lower <= 0:
+            raise ConfigError("thresholds.by_session upper_bps/lower_bps must "
+                              "be > 0")
+        for name, hhmm in (("start_utc", sess_start), ("end_utc", sess_end)):
+            parts = hhmm.split(":")
+            if (len(parts) != 2 or not all(p.isdigit() and len(p) == 2
+                                           for p in parts)
+                    or not (0 <= int(parts[0]) <= 23)
+                    or not (0 <= int(parts[1]) <= 59)):
+                raise ConfigError(
+                    f"thresholds.by_session.{name} must be HH:MM UTC, "
+                    f"got {hhmm!r}")
+
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
     if not 0.0 < take_fraction <= 1.0:
         raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
@@ -342,6 +379,11 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         midline_bps=float(thr["midline_bps"]),
         upper_bps=upper,
         lower_bps=lower,
+        auto_midline=auto_midline,
+        session_upper_bps=sess_upper,
+        session_lower_bps=sess_lower,
+        session_start_utc=sess_start,
+        session_end_utc=sess_end,
         take_fraction=take_fraction,
         max_order_notional=float(_get(raw, "sizing", "max_order_notional_usd", 500.0)),
         min_order_notional=float(_get(raw, "sizing", "min_order_notional_usd", 10.0)),
