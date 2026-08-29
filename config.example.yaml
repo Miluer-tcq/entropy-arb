@@ -52,13 +52,19 @@ thresholds:
   # by_session (optional): use a different (usually wider) band inside a UTC
   # time window — e.g. US regular hours, when premium noise roughly doubles.
   # Outside the window the global upper_bps/lower_bps apply. start > end wraps
-  # around midnight. Omit the whole block for one band around the clock.
+  # around midnight. Weekends (Sat/Sun UTC) always count as outside the
+  # window — US equities do not trade. midline_bps is optional: a session
+  # -specific center for the band (useful when the premium level itself
+  # shifts between sessions, not just its noise).
   # by_session（可选）：在指定 UTC 时间窗口内使用另一组（通常更宽的）
   # 带宽——例如美股常规时段，溢价噪声约为盘外两倍。窗口外用全局带宽。
-  # start > end 表示跨午夜。不需要分时段就整块省略。
+  # start > end 表示跨午夜。周六/周日（UTC）始终按窗口外处理（美股休市）。
+  # midline_bps 可选：给盘中配独立中枢——当溢价水平本身（不只是噪声幅度）
+  # 随时段变化时使用。
   # by_session:
   #   start_utc: "13:30"   # US equities regular open (13:30 UTC)
   #   end_utc: "20:00"     # US equities regular close (20:00 UTC)
+  #   midline_bps: -5.7    # optional per-session center / 可选的盘中独立中枢
   #   upper_bps: 6.0
   #   lower_bps: 6.0
 

@@ -145,6 +145,88 @@ def test_scan_respects_position_caps():
     assert run_scan(eng) is None
 
 
+SESSION_CFG = """
+thresholds:
+  midline_bps: -4.3
+  upper_bps: 5.0
+  lower_bps: 6.0
+  by_session:
+    start_utc: "13:30"
+    end_utc: "20:00"
+    midline_bps: -5.7
+    upper_bps: 5.5
+    lower_bps: 6.5
+execution:
+  premium_persist_sec: 0.0
+"""
+
+
+def _make_session_engine():
+    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    f.write(SESSION_CFG)
+    f.close()
+    cfg = load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter")
+    eng = Engine(cfg)
+    return eng
+
+
+def _freeze_utc(monkeypatch, *, weekday: int, hour: int, minute: int = 0):
+    """Pin engine's datetime.now(UTC) to a fixed instant.
+    weekday: 0=Mon … 5=Sat, 6=Sun (2026-08-29 is a Saturday)."""
+    import datetime as _dt
+    base = _dt.datetime(2026, 8, 24, hour, minute, tzinfo=_dt.timezone.utc)
+    fixed = base + _dt.timedelta(days=weekday)   # 2026-08-24 is a Monday
+    real_dt = _dt.datetime
+
+    class FakeDT(real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr("entropy_arb.engine.datetime", FakeDT)
+
+
+def test_band_global_when_no_session():
+    eng = make_engine(midline=-4.3, upper=5.0, lower=6.0)
+    assert eng.session_label() == ""
+    mid, up, lo = eng._band()
+    approx(mid, -4.3)
+    approx(up, 5.0)
+    approx(lo, 6.0)
+
+
+def test_band_session_inside_window(monkeypatch):
+    eng = _make_session_engine()
+    _freeze_utc(monkeypatch, weekday=2, hour=14)   # Wed 14:00 UTC — intraday
+    mid, up, lo = eng._band()
+    approx(mid, -5.7)
+    approx(up, 5.5)
+    approx(lo, 6.5)
+    assert eng.session_label() == "intraday"
+    # sell-entropy hurdle uses the SESSION midline + upper
+    approx(mid + up, -0.2)
+
+
+def test_band_weekend_uses_global(monkeypatch):
+    eng = _make_session_engine()
+    _freeze_utc(monkeypatch, weekday=5, hour=14)   # Sat 14:00 UTC
+    mid, up, lo = eng._band()
+    approx(mid, -4.3)
+    approx(up, 5.0)
+    approx(lo, 6.0)
+    assert eng.session_label() == "weekend"
+
+
+def test_band_offhours_outside_window(monkeypatch):
+    eng = _make_session_engine()
+    _freeze_utc(monkeypatch, weekday=2, hour=21)   # Wed 21:00 UTC — closed
+    mid, up, lo = eng._band()
+    approx(mid, -4.3)
+    approx(up, 5.0)
+    approx(lo, 6.0)
+    assert eng.session_label() == "offhours"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

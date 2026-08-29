@@ -137,6 +137,7 @@ class Config:
     auto_midline: bool = False
     session_upper_bps: Optional[float] = None
     session_lower_bps: Optional[float] = None
+    session_midline_bps: Optional[float] = None
     session_start_utc: Optional[str] = None
     session_end_utc: Optional[str] = None
     # runtime
@@ -166,6 +167,7 @@ _SCHEMA: Dict[str, Any] = {
         "by_session": {
             "start_utc": str,
             "end_utc": str,
+            "midline_bps": float,
             "upper_bps": float,
             "lower_bps": float,
         },
@@ -301,7 +303,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     auto_midline = bool(thr.get("auto_midline", False))
     sess = thr.get("by_session") or None
     sess_start = sess_end = None
-    sess_upper = sess_lower = None
+    sess_upper = sess_lower = sess_midline = None
     if sess is not None:
         for k in ("start_utc", "end_utc", "upper_bps", "lower_bps"):
             if k not in sess:
@@ -309,6 +311,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                                   f"when by_session is configured")
         sess_start, sess_end = sess["start_utc"], sess["end_utc"]
         sess_upper, sess_lower = float(sess["upper_bps"]), float(sess["lower_bps"])
+        sess_midline = (float(sess["midline_bps"])
+                        if sess.get("midline_bps") is not None else None)
         if sess_upper <= 0 or sess_lower <= 0:
             raise ConfigError("thresholds.by_session upper_bps/lower_bps must "
                               "be > 0")
@@ -382,6 +386,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         auto_midline=auto_midline,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,
+        session_midline_bps=sess_midline,
         session_start_utc=sess_start,
         session_end_utc=sess_end,
         take_fraction=take_fraction,

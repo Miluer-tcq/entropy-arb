@@ -111,6 +111,7 @@ thresholds:
   by_session:
     start_utc: "13:30"
     end_utc: "20:00"
+    midline_bps: -5.7
     upper_bps: 7.0
     lower_bps: 7.0
 """
@@ -120,12 +121,14 @@ def test_session_and_auto_midline_defaults():
     cfg = load(MINIMAL, hedge="lighter")
     assert cfg.auto_midline is False
     assert cfg.session_upper_bps is None and cfg.session_lower_bps is None
+    assert cfg.session_midline_bps is None
 
 
 def test_session_and_auto_midline_load():
     cfg = load(SESSION, hedge="lighter")
     assert cfg.auto_midline is True
     assert cfg.session_upper_bps == 7.0 and cfg.session_lower_bps == 7.0
+    assert cfg.session_midline_bps == -5.7
     assert cfg.session_start_utc == "13:30" and cfg.session_end_utc == "20:00"
 
 

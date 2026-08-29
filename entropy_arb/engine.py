@@ -271,30 +271,53 @@ class Engine:
         return max(ramp(buy, buy.position >= 0), ramp(sell, sell.position <= 0))
 
     def _band(self) -> tuple:
-        """Effective (upper_bps, lower_bps). The optional by_session block
-        replaces the global band while inside its UTC window."""
+        """Effective (midline, upper_bps, lower_bps). The optional by_session
+        block (with its own midline) applies inside its UTC window on
+        weekdays; outside the window — and on weekends, when US equities do
+        not trade — the global values apply."""
         cfg = self.cfg
         if cfg.session_upper_bps is None:
-            return cfg.upper_bps, cfg.lower_bps
-        now = datetime.now(timezone.utc).time()
+            return self.midline, cfg.upper_bps, cfg.lower_bps
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.weekday() >= 5:  # Sat/Sun: no US equity session
+            return self.midline, cfg.upper_bps, cfg.lower_bps
+        now = now_utc.time()
         start = dtime.fromisoformat(cfg.session_start_utc)
         end = dtime.fromisoformat(cfg.session_end_utc)
         inside = (start <= now < end if start < end
                   else (now >= start or now < end))
         if inside:
-            return cfg.session_upper_bps, cfg.session_lower_bps
-        return cfg.upper_bps, cfg.lower_bps
+            return (cfg.session_midline_bps
+                    if cfg.session_midline_bps is not None else self.midline,
+                    cfg.session_upper_bps, cfg.session_lower_bps)
+        return self.midline, cfg.upper_bps, cfg.lower_bps
+
+    def session_label(self) -> str:
+        """Which threshold set is active right now — for the dashboard.
+        Empty string when no by_session block is configured."""
+        cfg = self.cfg
+        if cfg.session_upper_bps is None:
+            return ""
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.weekday() >= 5:
+            return "weekend"
+        now = now_utc.time()
+        start = dtime.fromisoformat(cfg.session_start_utc)
+        end = dtime.fromisoformat(cfg.session_end_utc)
+        inside = (start <= now < end if start < end
+                  else (now >= start or now < end))
+        return "intraday" if inside else "offhours"
 
     def _eff_threshold(self, buy, sell) -> float:
         """Net hurdle (bps, on top of fees) for the direction buy->sell.
 
         selling entropy: executable premium must clear midline + upper;
         buying entropy: the reverse premium must clear lower - midline."""
-        up, lo = self._band()
+        mid, up, lo = self._band()
         if sell.key == "entropy":
-            base = self.midline + up
+            base = mid + up
         else:
-            base = lo - self.midline
+            base = lo - mid
         return base + self._inv_add_bps(buy, sell)
 
     def _headroom(self, buy, sell, ref_px: float) -> float:
@@ -824,11 +847,11 @@ class Engine:
             pnl = self.session_pnl()
             rec = (f" | rec {self.recorder.rows_written} rows"
                    if self.recorder else "")
-            up, lo = self._band()
+            mid, up, lo = self._band()
             log.info("[status] %s | prem %s bps (band %+.2f..%+.2f) | pos %s "
                      "net %+.6g | trades %d hedges %d | MTM %s expEdge $%.4f "
                      "fillEdge $%.4f%s%s",
-                     books, prem_s, self.midline - lo, self.midline + up,
+                     books, prem_s, mid - lo, mid + up,
                      pos, net, self.trades, self.hedges,
                      f"${pnl:+.4f}" if pnl is not None else "—",
                      self.total_exp_edge, self.total_fill_edge, rec,
@@ -856,7 +879,7 @@ class Engine:
                             f"{plan.buy_notional:.2f}", f"{plan.sell_notional:.2f}",
                             f"{plan.exp_edge_usd:.4f}", f"{plan.gross_edge_usd:.4f}",
                             f"{plan.marginal_premium_bps:.3f}",
-                            f"{self.midline:.3f}",
+                            f"{self._band()[0]:.3f}",
                             f"{inv_bps:.3f}", int(ok), f"{bfill:.8g}",
                             f"{sfill:.8g}", bstatus, sstatus, f"{fill_edge:.4f}"])
         except Exception:
