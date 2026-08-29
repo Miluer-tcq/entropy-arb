@@ -39,6 +39,28 @@ thresholds:
   midline_bps: 0.0     # persistent premium center / 溢价长期中枢
   upper_bps: 4.0       # entry above midline: sell entropy / 中枢上方入场带宽
   lower_bps: 4.0       # entry below midline: buy entropy / 中枢下方入场带宽
+  #
+  # auto_midline (opt-in, default false): follow the rolling 6h median of the
+  # recorder data instead of the fixed midline above — clamped to ±3 bps
+  # around the configured value, and only with enough recent samples. The
+  # dashboard's WATCH panel always shows the drift, on or off.
+  # auto_midline（可选，默认关）：中枢跟随最近 6 小时录得数据的中位数，
+  # 但限制在配置值的 ±3 bps 内，且样本足够才生效。无论开关，仪表盘
+  # WATCH 面板都会显示漂移值。
+  # auto_midline: true
+  #
+  # by_session (optional): use a different (usually wider) band inside a UTC
+  # time window — e.g. US regular hours, when premium noise roughly doubles.
+  # Outside the window the global upper_bps/lower_bps apply. start > end wraps
+  # around midnight. Omit the whole block for one band around the clock.
+  # by_session（可选）：在指定 UTC 时间窗口内使用另一组（通常更宽的）
+  # 带宽——例如美股常规时段，溢价噪声约为盘外两倍。窗口外用全局带宽。
+  # start > end 表示跨午夜。不需要分时段就整块省略。
+  # by_session:
+  #   start_utc: "13:30"   # US equities regular open (13:30 UTC)
+  #   end_utc: "20:00"     # US equities regular close (20:00 UTC)
+  #   upper_bps: 6.0
+  #   lower_bps: 6.0
 
 # ======================== VENUES / 交易所参数 ==============================
 entropy:

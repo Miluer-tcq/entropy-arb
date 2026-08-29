@@ -102,6 +102,69 @@ def test_nonpositive_band():
                  "must be > 0")
 
 
+SESSION = """
+thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_midline: true
+  by_session:
+    start_utc: "13:30"
+    end_utc: "20:00"
+    upper_bps: 7.0
+    lower_bps: 7.0
+"""
+
+
+def test_session_and_auto_midline_defaults():
+    cfg = load(MINIMAL, hedge="lighter")
+    assert cfg.auto_midline is False
+    assert cfg.session_upper_bps is None and cfg.session_lower_bps is None
+
+
+def test_session_and_auto_midline_load():
+    cfg = load(SESSION, hedge="lighter")
+    assert cfg.auto_midline is True
+    assert cfg.session_upper_bps == 7.0 and cfg.session_lower_bps == 7.0
+    assert cfg.session_start_utc == "13:30" and cfg.session_end_utc == "20:00"
+
+
+def test_session_requires_all_keys():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  by_session:
+    start_utc: "13:30"
+""", "'thresholds.by_session.end_utc' is required")
+
+
+def test_session_bad_time_format():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  by_session:
+    start_utc: "9am"
+    end_utc: "20:00"
+    upper_bps: 7.0
+    lower_bps: 7.0
+""", "must be HH:MM UTC")
+
+
+def test_session_nonpositive_band():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  by_session:
+    start_utc: "13:30"
+    end_utc: "20:00"
+    upper_bps: 0.0
+    lower_bps: 7.0
+""", "by_session upper_bps/lower_bps must be > 0")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -31,6 +31,77 @@ from entropy_arb.config import HEDGE_VENUES, ConfigError, load_config
 from entropy_arb.engine import Engine
 
 
+class InstanceLock:
+    """One process per config file: a second start with the same --config
+    would double-write the CSVs and race the same signing keys."""
+
+    def __init__(self, config_file: str) -> None:
+        stem = os.path.splitext(os.path.basename(config_file))[0]
+        self.path = os.path.join("logs", f".lock-{stem}.pid")
+        self.acquired = False
+
+    def acquire(self) -> None:
+        d = os.path.dirname(self.path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pid = self._existing_pid()
+                if pid is not None and _pid_alive(pid):
+                    print(f"another instance is running with this config "
+                          f"(PID {pid}) — refuse to start. If that is wrong, "
+                          f"delete {self.path}", file=sys.stderr)
+                    sys.exit(2)
+                try:
+                    os.remove(self.path)   # stale lock from a crashed run
+                except OSError:
+                    pass
+                continue
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            self.acquired = True
+            return
+        print("could not acquire the instance lock — giving up",
+              file=sys.stderr)
+        sys.exit(2)
+
+    def _existing_pid(self) -> int | None:
+        try:
+            with open(self.path) as fh:
+                return int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            return None
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        self.acquired = False
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if h:   # PROCESS_QUERY_LIMITED_INFORMATION
+            k.CloseHandle(h)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)   # POSIX existence probe
+        return True
+    except OSError:
+        return False
+
+
 def setup_logging(level: str, log_file: str = None,
                   extra_handler: logging.Handler = None) -> None:
     root = logging.getLogger()
@@ -97,6 +168,10 @@ def main() -> None:
     p.add_argument("--record-only", action="store_true",
                    help="only collect minute data, run no strategy, send no "
                         "orders (needs no credentials)")
+    p.add_argument("--preflight", action="store_true",
+                   help="run startup checks (env format, SDK imports, "
+                        "markets, margin vs caps, data freshness, midline "
+                        "drift) and exit / 上线预检，输出红绿清单后退出")
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()
@@ -112,6 +187,14 @@ def main() -> None:
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         sys.exit(2)
+
+    if args.preflight:
+        from entropy_arb.preflight import run_preflight
+        ok = asyncio.run(run_preflight(cfg))
+        sys.exit(0 if ok else 1)
+
+    lock = InstanceLock(args.config)
+    lock.acquire()
 
     use_dashboard = (cfg.dashboard or args.dashboard) and not args.no_dashboard
     force_tty = args.dashboard
@@ -143,6 +226,10 @@ def main() -> None:
         # unreachable) — a clean message, not a traceback
         print(f"startup error: {e}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
