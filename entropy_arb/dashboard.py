@@ -203,13 +203,13 @@ class Dashboard:
             mid.add_row(self._venues_panel(), self._session_panel())
         else:
             mid = Group(self._venues_panel(), self._session_panel())
-        # Height budget: header+venues+session+signal ≈ 21 rows on a wide
+        # Height budget: header+venues+session+signal ≈ 25 rows on a wide
         # terminal; everything left goes to trades + events. On short
         # terminals the trades panel is dropped (executions also appear in
         # the events log and the trades CSV). Non-terminal consoles (tests,
         # export) have no usable height — render everything.
         if self.console.is_terminal:
-            budget = (self.console.size.height or 45) - 21
+            budget = (self.console.size.height or 45) - 25
             if budget >= 12:
                 trade_rows = max(3, min(TRADE_ROWS, budget - 8))
                 event_lines = max(4, min(16, budget - trade_rows - 4))
@@ -322,30 +322,30 @@ class Dashboard:
         drift_cell = (Text(f"{drift:+.2f}", style=d_style) if drift is not None
                       else Text("—", style="dim"))
         g = Table.grid(padding=(0, 2))
-        g.add_column(justify="left", style="dim", no_wrap=True)    # L label
-        g.add_column(justify="left", no_wrap=True)                 # L value
-        g.add_column(justify="left", style="dim", no_wrap=True)    # R label
-        g.add_column(justify="left", no_wrap=True)                 # R value
+        g.add_column(justify="left", style="dim", no_wrap=True)
+        g.add_column(justify="left", no_wrap=True)
         g.add_row(self._t("trading session"),
-                  Text(f"{sess_label} [{mid - lo:+.1f} … {mid + up:+.1f}]"),
-                  self._t("midline drift (1h)"),
+                  Text(f"{sess_label} [{mid - lo:+.1f} … {mid + up:+.1f}]"))
+        g.add_row(self._t("midline drift (1h)"),
                   Text.assemble(drift_cell, (f" n={n}", "dim")))
-        g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()),
-                  self._t("Σ edge (exp/fill)"),
-                  Text.assemble(_usd(eng.total_exp_edge), (" / ", "dim"),
-                                _usd(eng.total_fill_edge)))
-        g.add_row(self._t("account Δ"), _usd(eng.account_delta()),
-                  self._t("trades / hedges"),
-                  Text.assemble(f"{eng.trades} / {eng.hedges}",
-                                ("  ·  ", "dim"), (last, "dim")))
+        g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()))
+        g.add_row(self._t("account Δ"), _usd(eng.account_delta()))
         eqs = [v.equity for v in eng.venues.values()]
         g.add_row(self._t("Σ equity"),
                   _usd(sum(eqs) if all(e is not None for e in eqs) else None,
-                       signed=False, decimals=2),
-                  self._t("net delta"),
+                       signed=False, decimals=2))
+        g.add_row(self._t("Σ edge (exp/fill)"),
+                  Text.assemble(_usd(eng.total_exp_edge), (" / ", "dim"),
+                                _usd(eng.total_fill_edge)))
+        g.add_row(self._t("trades / hedges"),
+                  Text.assemble(f"{eng.trades} / {eng.hedges}",
+                                ("  ·  ", "dim"), (last, "dim")))
+        g.add_row(self._t("net delta"),
                   Text(f"{net:+.6g}",
                        style="bold red"
                        if abs(net) > cfg.net_tolerance_base else "dim"))
+        g.add_row(self._t("errors"), Text(str(eng.consec_errors),
+                  style="bold red" if eng.consec_errors else "dim"))
         return Panel(g, title=self._t("session"), box=box.ROUNDED,
                      padding=(0, 1))
 
