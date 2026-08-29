@@ -93,6 +93,8 @@ class Engine:
         self.funding: Dict[str, Optional[float]] = {}
         self.drift: Dict[str, Optional[float]] = {"median": None,
                                                   "drift": None, "n": 0}
+        self.drift_1h: Dict[str, Optional[float]] = {"median": None,
+                                                     "drift": None, "n": 0}
 
     # ------------------------------------------------------------- utilities
 
@@ -815,6 +817,8 @@ class Engine:
             return
         rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps, 24.0)
         self.drift = rep
+        self.drift_1h = drift_report(self.cfg.recorder_csv,
+                                     self.cfg.midline_bps, 1.0)
         if rep["drift"] is not None and self.cfg.auto_midline:
             clamped = min(max(rep["median"],
                               self.cfg.midline_bps - self.AUTO_MIDLINE_CLAMP_BPS),

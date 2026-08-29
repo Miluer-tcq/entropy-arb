@@ -102,13 +102,7 @@ _ZH = {
     "no executions yet": "暂无执行",
     "events (full log: {f})": "日志事件（完整日志：{f}）",
     "watch": "监控",
-    "taker fees": "吃单手续费",
-    "funding": "资金费率",
-    "midline drift (24h)": "中枢漂移 (24h)",
-    "suggest {m:+.1f}": "建议 {m:+.1f}",
-    "auto-on": "自动调整已开启",
-    "free / cap": "可用 / 上限",
-    "LOW": "偏低",
+    "midline drift (1h)": "中枢偏移 (1h)",
     "n={n}": "样本={n}",
     "entropy-arb stopped": "entropy-arb 已停止",
     " — {t} trades / {h} hedges, session PnL ": " —— 执行 {t} / 对冲 {h}，会话盈亏 ",
@@ -209,13 +203,13 @@ class Dashboard:
             mid.add_row(self._venues_panel(), self._session_panel())
         else:
             mid = Group(self._venues_panel(), self._session_panel())
-        # Height budget: header+venues+session+signal+watch ≈ 27 rows on a
-        # wide terminal; everything left goes to trades + events. On short
+        # Height budget: header+venues+session+signal ≈ 21 rows on a wide
+        # terminal; everything left goes to trades + events. On short
         # terminals the trades panel is dropped (executions also appear in
         # the events log and the trades CSV). Non-terminal consoles (tests,
         # export) have no usable height — render everything.
         if self.console.is_terminal:
-            budget = (self.console.size.height or 45) - 27
+            budget = (self.console.size.height or 45) - 21
             if budget >= 12:
                 trade_rows = max(3, min(TRADE_ROWS, budget - 8))
                 event_lines = max(4, min(16, budget - trade_rows - 4))
@@ -230,8 +224,7 @@ class Dashboard:
                       self._events_panel(event_lines))
         else:
             bottom = (self._events_panel(event_lines),)
-        return Group(self._header(), mid, self._signal_panel(),
-                     self._watch_panel(), *bottom)
+        return Group(self._header(), mid, self._signal_panel(), *bottom)
 
     def _header(self):
         eng, cfg = self.eng, self.eng.cfg
@@ -318,32 +311,41 @@ class Dashboard:
         net = sum(v.position for v in eng.venues.values())
         last = (self._t("{s}s ago", s=f"{time.time() - eng.last_trade_ts:.0f}")
                 if eng.last_trade_ts else "—")
-        g = Table.grid(padding=(0, 2))
-        g.add_column(justify="left", style="dim", no_wrap=True)
-        g.add_column(justify="right", no_wrap=True)
         # active trading session + the band it drives (compact one-liner)
         sess = eng.session_label()
         sess_label = self._t(sess) if sess else self._t("all-day")
         mid, up, lo = eng._band()
+        drift, n = eng.drift_1h.get("drift"), eng.drift_1h.get("n", 0)
+        d_style = ("bold red" if drift is not None and abs(drift) >= 2.0
+                   else ("yellow" if drift is not None and abs(drift) >= 1.0
+                         else "green"))
+        drift_cell = (Text(f"{drift:+.2f}", style=d_style) if drift is not None
+                      else Text("—", style="dim"))
+        g = Table.grid(padding=(0, 2))
+        g.add_column(justify="left", style="dim", no_wrap=True)    # L label
+        g.add_column(justify="left", no_wrap=True)                 # L value
+        g.add_column(justify="left", style="dim", no_wrap=True)    # R label
+        g.add_column(justify="left", no_wrap=True)                 # R value
         g.add_row(self._t("trading session"),
-                  Text(f"{sess_label}  [{mid - lo:+.1f} … {mid + up:+.1f}]"))
-        g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()))
-        g.add_row(self._t("account Δ"), _usd(eng.account_delta()))
+                  Text(f"{sess_label} [{mid - lo:+.1f} … {mid + up:+.1f}]"),
+                  self._t("midline drift (1h)"),
+                  Text.assemble(drift_cell, (f" n={n}", "dim")))
+        g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()),
+                  self._t("Σ edge (exp/fill)"),
+                  Text.assemble(_usd(eng.total_exp_edge), (" / ", "dim"),
+                                _usd(eng.total_fill_edge)))
+        g.add_row(self._t("account Δ"), _usd(eng.account_delta()),
+                  self._t("trades / hedges"),
+                  Text.assemble(f"{eng.trades} / {eng.hedges}",
+                                ("  ·  ", "dim"), (last, "dim")))
         eqs = [v.equity for v in eng.venues.values()]
         g.add_row(self._t("Σ equity"),
                   _usd(sum(eqs) if all(e is not None for e in eqs) else None,
-                       signed=False, decimals=2))
-        g.add_row(self._t("Σ edge (exp/fill)"),
-                  Text.assemble(_usd(eng.total_exp_edge), (" / ", "dim"),
-                                _usd(eng.total_fill_edge)))
-        g.add_row(self._t("trades / hedges"),
-                  Text.assemble(f"{eng.trades} / {eng.hedges}", ("  ·  ", "dim"),
-                                (last, "dim")))
-        g.add_row(self._t("net delta"), Text(f"{net:+.6g}",
-                  style="bold red" if abs(net) > cfg.net_tolerance_base
-                  else "dim"))
-        g.add_row(self._t("errors"), Text(str(eng.consec_errors),
-                  style="bold red" if eng.consec_errors else "dim"))
+                       signed=False, decimals=2),
+                  self._t("net delta"),
+                  Text(f"{net:+.6g}",
+                       style="bold red"
+                       if abs(net) > cfg.net_tolerance_base else "dim"))
         return Panel(g, title=self._t("session"), box=box.ROUNDED,
                      padding=(0, 1))
 
@@ -399,56 +401,6 @@ class Dashboard:
                      title=self._t("signal — executable premium vs full "
                                    "hurdle incl. fees (● = armed)"),
                      box=box.ROUNDED, padding=(0, 1))
-
-    def _fmt_funding(self, rate: Optional[float]) -> str:
-        return "—" if rate is None else f"{rate * 100:.4f}%"
-
-    def _watch_panel(self):
-        eng, cfg = self.eng, self.eng.cfg
-        g = Table.grid(padding=(0, 2))
-        g.add_column(justify="left", style="dim", no_wrap=True)
-        g.add_column(justify="right", no_wrap=False, overflow="fold")
-        g.add_column(justify="left", no_wrap=False, overflow="fold")
-
-        srcs = {getattr(v, "fee_src", "config") for v in eng.venues.values()}
-        src = srcs.pop() if len(srcs) == 1 else "mixed"
-        fees = " / ".join(f"{v.name} {v.fee_bps:.2f}"
-                          for v in eng.venues.values())
-        g.add_row(self._t("taker fees"), f"{fees} bps", f"({src})")
-
-        fund = []
-        for key in ("entropy", "hedge"):
-            v = eng.venues.get(key)
-            if v is not None:
-                fund.append(f"{v.name} "
-                            f"{self._fmt_funding(eng.funding.get(key))}")
-        g.add_row(self._t("funding"), " / ".join(fund), "")
-
-        med, drift = eng.drift.get("median"), eng.drift.get("drift")
-        if drift is None:
-            g.add_row(self._t("midline drift (24h)"), "—",
-                      self._t("n={n}", n=eng.drift.get("n", 0)))
-        else:
-            style = ("bold red" if abs(drift) >= 3.0
-                     else ("yellow" if abs(drift) >= 1.5 else "green"))
-            tail = (self._t("auto-on") if cfg.auto_midline
-                    else self._t("suggest {m:+.1f}", m=med))
-            g.add_row(self._t("midline drift (24h)"),
-                      Text(f"{med:+.2f} ({drift:+.2f})", style=style), tail)
-
-        free_bits = []
-        low = False
-        for v in eng.venues.values():
-            if v.free is None:
-                free_bits.append(f"{v.name} —")
-            else:
-                low = low or v.free < max(cfg.min_order_notional,
-                                          0.25 * v.cap_usd)
-                free_bits.append(f"{v.name} ${v.free:,.0f}/{v.cap_usd:,.0f}")
-        g.add_row(self._t("free / cap"), " / ".join(free_bits),
-                  Text(self._t("LOW"), style="bold red") if low else "")
-        return Panel(g, title=self._t("watch"), box=box.ROUNDED,
-                     padding=(0, 1))
 
     def _trades_panel(self, max_rows: int = TRADE_ROWS):
         eng = self.eng

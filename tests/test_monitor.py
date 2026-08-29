@@ -34,7 +34,9 @@ def test_median():
 
 def test_read_series_window_and_drift():
     now = time.time()
-    p = write_csv([(now - 3600, 5.0), (now - 60, 4.0), (now - 30, 6.0)])
+    # boundary row parked well outside the 1h window (an exact-edge row
+    # would race the clock between the test and the reader)
+    p = write_csv([(now - 3700, 5.0), (now - 60, 4.0), (now - 30, 6.0)])
     xs = read_premium_series(p, hours=1.0)
     assert xs == [4.0, 6.0]
     rep = drift_report(p, midline_bps=3.0, hours=1.0, min_samples=2)
