@@ -783,7 +783,8 @@ class Engine:
             return None
         return (em / hm - 1.0) * 1e4
 
-    WATCH_INTERVAL_SEC = 60.0
+    WATCH_INTERVAL_SEC = 15.0   # funding + 1h drift refresh (drift only
+                                # changes when the recorder writes a minute)
     AUTO_MIDLINE_CLAMP_BPS = 3.0
 
     async def _watch_loop(self) -> None:

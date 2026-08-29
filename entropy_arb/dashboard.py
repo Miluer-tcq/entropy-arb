@@ -203,28 +203,48 @@ class Dashboard:
             mid.add_row(self._venues_panel(), self._session_panel())
         else:
             mid = Group(self._venues_panel(), self._session_panel())
-        # Height budget: header+venues+session+signal ≈ 25 rows on a wide
-        # terminal; everything left goes to trades + events. On short
-        # terminals the trades panel is dropped (executions also appear in
-        # the events log and the trades CSV). Non-terminal consoles (tests,
-        # export) have no usable height — render everything.
-        if self.console.is_terminal:
-            budget = (self.console.size.height or 45) - 25
-            if budget >= 12:
-                trade_rows = max(3, min(TRADE_ROWS, budget - 8))
-                event_lines = max(4, min(16, budget - trade_rows - 4))
-                show_trades = True
-            else:
-                trade_rows, show_trades = 0, False
-                event_lines = max(4, min(16, budget - 2))
-        else:
-            show_trades, trade_rows, event_lines = True, TRADE_ROWS, EVENT_LINES
-        if show_trades:
-            bottom = (self._trades_panel(trade_rows),
-                      self._events_panel(event_lines))
-        else:
-            bottom = (self._events_panel(event_lines),)
-        return Group(self._header(), mid, self._signal_panel(), *bottom)
+        # Fill the terminal exactly: measure the fixed panels, give the
+        # trades panel what fits, and hand every remaining row to the
+        # events panel so the TUI never leaves a blank bottom strip.
+        # Non-terminal consoles (tests, export) have no usable height.
+        if not self.console.is_terminal:
+            return Group(self._header(), mid, self._signal_panel(),
+                         self._trades_panel(),
+                         self._events_panel(EVENT_LINES))
+        total = self.console.size.height or 45
+        fixed = self._measure(self._header(), mid, self._signal_panel())
+        avail = max(total - fixed, 6)    # rows for trades + events panels
+        # fill: events content rows = avail − trades panel − its 2 borders
+        # (_events_panel pads its content to exactly the requested rows)
+        trades = self._trades_panel()
+        t_h = self._measure(trades)
+        if avail - t_h - 2 >= 5:
+            return Group(self._header(), mid, self._signal_panel(), trades,
+                         self._events_panel(avail - t_h - 2))
+        # short terminal: shrink the trades panel to what leaves ≥5 event
+        # rows; if nothing fits, drop it (executions also live in the
+        # events log and the trades CSV)
+        for rows in range(TRADE_ROWS, 2, -1):
+            t = self._trades_panel(rows)
+            h = self._measure(t)
+            if avail - h - 2 >= 5:
+                return Group(self._header(), mid, self._signal_panel(), t,
+                             self._events_panel(avail - h - 2))
+        return Group(self._header(), mid, self._signal_panel(),
+                     self._events_panel(max(avail - 2, 4)))
+
+    def _measure(self, *renderables) -> int:
+        """Rendered row count of the given panels at current console size.
+        Options must NOT carry a height — panels expand vertically to a
+        set height, which would break the measurement."""
+        n = 0
+        try:
+            for r in renderables:
+                n += len(self.console.render_lines(
+                    r, self.console.options, pad=False, new_lines=False))
+        except Exception:
+            return 0
+        return n
 
     def _header(self):
         eng, cfg = self.eng, self.eng.cfg
@@ -434,17 +454,42 @@ class Dashboard:
                                       n=max_rows),
                      box=box.ROUNDED, padding=(0, 1))
 
-    def _events_panel(self, max_lines: int = EVENT_LINES):
-        # wrap long lines instead of clipping them (overflow ellipsis hid
-        # the tail of long warnings); budget scales with terminal height
+    def _events_panel(self, max_rows: int = EVENT_LINES):
+        """Show the newest log lines within an exact visual-row budget so
+        the panel (and therefore the whole TUI) fills the terminal bottom
+        without blank space. Long lines wrap; CJK double-width is counted."""
+        width = max((self.console.size.width or 120) - 4, 10)
         body = Text()
-        lines = list(self.log_buffer.lines)[-max_lines:]
-        if not lines:
+        picked = []
+        used = 0
+        for lvl, msg in reversed(self.log_buffer.lines):
+            rows = self._msg_rows(msg, width)
+            if picked and used + rows > max_rows:
+                break
+            picked.append((lvl, msg))
+            used += rows
+            if used >= max_rows:
+                break
+        if not picked:
             body.append("—", style="dim")
-        for i, (lvl, msg) in enumerate(lines):
+        for i, (lvl, msg) in enumerate(reversed(picked)):
             if i:
                 body.append("\n")
             body.append(msg, style=LEVEL_STYLE.get(lvl, ""))
+        if picked and used < max_rows:
+            # pad with blank lines so the panel is EXACTLY max_rows visual
+            # rows and the TUI fills the terminal bottom with no gaps
+            body.append("\n" * (max_rows - used))
         return Panel(body, title=self._t("events (full log: {f})",
                                          f=self.log_file),
                      box=box.ROUNDED, padding=(0, 1))
+
+    @staticmethod
+    def _msg_rows(msg: str, width: int) -> int:
+        """Visual rows a message occupies once folded at `width` cells."""
+        from rich.cells import cell_len
+        total = 0
+        for seg in str(msg).split("\n"):
+            w = cell_len(seg)
+            total += max(1, -(-w // width))
+        return max(total, 1)
