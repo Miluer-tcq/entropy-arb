@@ -77,6 +77,7 @@ class HLVenue:
         self.start_equity = None
         self.include_core_equity = True  # cleared when two venues share one account
         self.fee_bps = conf.fee_bps
+        self.fee_src = "config"
         self.cap_usd = conf.cap_usd
         self.orders_per_min = conf.orders_per_min
         self.last_traded_ts = 0.0
@@ -332,6 +333,40 @@ class HLVenue:
             return float(st.get("withdrawable") or 0.0)
         except Exception as e:
             log.debug("[%s] withdrawable fetch failed: %r", self.name, e)
+            return None
+
+    async def fetch_fee(self) -> Optional[float]:
+        """Account's effective taker rate from the userFees endpoint (bps).
+        None when unavailable or outside the sanity range — callers keep the
+        configured value in that case."""
+        addr = self._query_address()
+        if addr is None:
+            return None
+        try:
+            r = await self._info({"type": "userFees", "user": addr})
+            rate = r.get("userCrossRate")
+            if rate is None:
+                return None
+            bps = float(rate) * 1e4
+        except Exception as e:
+            log.debug("[%s] userFees fetch failed: %r", self.name, e)
+            return None
+        return bps if 0.0 <= bps <= 20.0 else None
+
+    async def fetch_funding(self) -> Optional[float]:
+        """Current hourly funding rate (decimal) for this venue's coin, from
+        the dex's metaAndAssetCtxs. None when unavailable."""
+        try:
+            meta, ctxs = await self._info(
+                {"type": "metaAndAssetCtxs", "dex": self.conf.hl_dex})
+            names = [a["name"] for a in meta.get("universe") or []]
+            if self.coin not in names:
+                return None
+            ctx = ctxs[names.index(self.coin)] or {}
+            f = ctx.get("funding")
+            return float(f) if f is not None else None
+        except Exception as e:
+            log.debug("[%s] funding fetch failed: %r", self.name, e)
             return None
 
     async def fetch_position(self) -> float:

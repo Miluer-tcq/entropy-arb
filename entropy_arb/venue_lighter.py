@@ -156,6 +156,7 @@ class LighterVenue:
         self.free = None
         self.start_equity = None
         self.fee_bps = conf.fee_bps
+        self.fee_src = "config"
         self.cap_usd = conf.cap_usd
         self.orders_per_min = conf.orders_per_min
         self.last_traded_ts = 0.0
@@ -191,11 +192,19 @@ class LighterVenue:
             self.size_decimals = int(ob["supported_size_decimals"])
             self.min_base = float(ob["min_base_amount"])
             self.min_quote = float(ob["min_quote_amount"])
+            try:
+                auto_fee = float(ob.get("taker_fee") or 0.0) * 1e4
+            except (TypeError, ValueError):
+                auto_fee = None
+            if auto_fee is not None and 0.0 <= auto_fee <= 20.0:
+                self.fee_bps = auto_fee
+                self.fee_src = "auto"
             log.info("[%s] %s market_id=%d px_dec=%d sz_dec=%d min_base=%s "
-                     "min_quote=%s taker_fee=%s", self.name, ob["symbol"],
+                     "min_quote=%s taker_fee=%s (%.2f bps, %s)",
+                     self.name, ob["symbol"],
                      self.market_id, self.price_decimals, self.size_decimals,
                      ob["min_base_amount"], ob["min_quote_amount"],
-                     ob.get("taker_fee"))
+                     ob.get("taker_fee"), self.fee_bps, self.fee_src)
             return
         raise RuntimeError(f"[{self.name}] {self.conf.symbol} not found on "
                            f"{self.profile.name}")
@@ -339,6 +348,22 @@ class LighterVenue:
             return None
         return (float(acct.get("total_asset_value") or 0.0),
                 float(acct.get("available_balance") or 0.0))
+
+    async def fetch_funding(self) -> Optional[float]:
+        """Current funding rate for this market (raw exchange value; Lighter
+        reports one entry per source exchange, averaged here). None when
+        unavailable."""
+        if self.market_id < 0:
+            return None
+        try:
+            data = await self._get("/api/v1/funding-rates",
+                                   params={"market_id": str(self.market_id)})
+            rates = [float(fr["rate"]) for fr in data.get("funding_rates") or []
+                     if int(fr.get("market_id", -1)) == self.market_id]
+        except Exception as e:
+            log.debug("[%s] funding fetch failed: %r", self.name, e)
+            return None
+        return sum(rates) / len(rates) if rates else None
 
     async def fetch_position(self) -> float:
         acct = await self._account()
