@@ -357,15 +357,16 @@ class HLVenue:
 
     async def _is_unified(self, addr: str) -> bool:
         """True when the account uses the "unifiedAccount" abstraction
-        (spot USDC directly backs perp dex orders). Cached — restart to
-        pick up a changed abstraction level."""
+        (spot USDC directly backs perp dex orders). A successful lookup is
+        cached; a transient failure is NOT cached — it retries on the next
+        equity poll instead of freezing a wrong answer."""
         if self._unified is None:
             try:
                 r = await self._info({"type": "userAbstraction", "user": addr})
-                self._unified = r == "unifiedAccount"
             except Exception as e:
                 log.debug("[%s] abstraction lookup failed: %r", self.name, e)
-                self._unified = False
+                return False
+            self._unified = r == "unifiedAccount"
         return self._unified
 
     async def _dex_withdrawable(self, addr: str) -> Optional[float]:

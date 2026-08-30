@@ -817,8 +817,11 @@ class Engine:
             return
         rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps, 24.0)
         self.drift = rep
+        # 1h display window: only 15 samples required — a fresh restart (or
+        # a recorder gap) must not blank the session panel for 30 minutes
         self.drift_1h = drift_report(self.cfg.recorder_csv,
-                                     self.cfg.midline_bps, 1.0)
+                                     self.cfg.midline_bps, 1.0,
+                                     min_samples=15)
         if rep["drift"] is not None and self.cfg.auto_midline:
             clamped = min(max(rep["median"],
                               self.cfg.midline_bps - self.AUTO_MIDLINE_CLAMP_BPS),

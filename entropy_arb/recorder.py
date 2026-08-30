@@ -62,6 +62,8 @@ class _MinuteAgg:
         self.e_bid = self.e_ask = self.h_bid = self.h_ask = 0.0
 
     def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float) -> None:
+        if min(e_bid, e_ask, h_bid, h_ask) <= 0.0:
+            raise ValueError("non-positive book price — sample discarded")
         e_mid = (e_bid + e_ask) / 2.0
         h_mid = (h_bid + h_ask) / 2.0
         prem = (e_mid / h_mid - 1.0) * 1e4

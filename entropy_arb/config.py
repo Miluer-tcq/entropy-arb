@@ -224,6 +224,27 @@ class ConfigError(ValueError):
     pass
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys — a repeated
+    `thresholds:` block silently overriding itself contradicts the
+    'a typo is an error' contract."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for k_node, _ in node.value:
+            key = self.construct_object(k_node, deep=deep)
+            try:
+                dup = key in seen
+            except TypeError:
+                dup = False
+            if dup:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate config key {key!r}",
+                    k_node.start_mark)
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _validate(node: Any, schema: Dict[str, Any], path: str = "") -> None:
     if not isinstance(node, dict):
         raise ConfigError(f"'{path or '<root>'}' must be a mapping")
@@ -262,7 +283,23 @@ def _env_s(name: str) -> Optional[str]:
 
 def _env_i(name: str) -> Optional[int]:
     v = os.getenv(name)
-    return int(v) if v not in (None, "") else None
+    if v in (None, ""):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise ConfigError(f"environment variable {name}={v!r} is not an "
+                          f"integer / 环境变量必须是整数") from None
+
+
+def _validated_log_level(level) -> str:
+    lv = str(level).strip().upper()
+    import logging
+    if lv not in logging.getLevelNamesMapping():
+        raise ConfigError(f"logging.level {level!r} is not a valid level "
+                          f"(valid: DEBUG, INFO, WARNING, ERROR, CRITICAL) "
+                          f"/ 日志级别无效")
+    return lv
 
 
 # -------------------------------------------------------------------- loading
@@ -271,13 +308,16 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 symbol: str, hedge_venue: str) -> Config:
     load_dotenv(env_file)
     try:
-        with open(config_file) as fh:
-            raw = yaml.safe_load(fh) or {}
+        with open(config_file, encoding="utf-8-sig") as fh:
+            raw = yaml.load(fh, Loader=_StrictLoader) or {}
     except FileNotFoundError:
         raise ConfigError(
             f"config file '{config_file}' not found — copy config.example.yaml "
             f"to config.yaml and edit it / 未找到配置文件，请先复制 "
             f"config.example.yaml 为 config.yaml 并修改")
+    except yaml.YAMLError as e:
+        raise ConfigError(f"invalid YAML in '{config_file}': {e} / "
+                          f"配置文件 YAML 语法错误") from e
     _validate(raw, _SCHEMA)
 
     symbol = (symbol or "").strip()
@@ -325,12 +365,25 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 raise ConfigError(
                     f"thresholds.by_session.{name} must be HH:MM UTC, "
                     f"got {hhmm!r}")
+        if sess_start == sess_end:
+            raise ConfigError("thresholds.by_session start_utc == end_utc is "
+                              "ambiguous (treated as all-day) — remove the "
+                              "by_session block for one band around the "
+                              "clock, or fix the times")
 
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
     if not 0.0 < take_fraction <= 1.0:
         raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
                           "more than the profitable depth loses money on the "
                           "tail / 必须在 (0, 1] 之间")
+
+    max_ntl = float(_get(raw, "sizing", "max_order_notional_usd", 500.0))
+    min_ntl = float(_get(raw, "sizing", "min_order_notional_usd", 10.0))
+    if max_ntl < min_ntl:
+        raise ConfigError(
+            "sizing.max_order_notional_usd must be >= "
+            "min_order_notional_usd — otherwise every slice is below the "
+            "minimum and the bot never trades / 单笔上限不能小于下限")
 
     entropy_dex = _get(raw, "entropy", "dex", "io")
     if hedge_venue == "tradexyz" and entropy_dex == "xyz":
@@ -390,8 +443,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         session_start_utc=sess_start,
         session_end_utc=sess_end,
         take_fraction=take_fraction,
-        max_order_notional=float(_get(raw, "sizing", "max_order_notional_usd", 500.0)),
-        min_order_notional=float(_get(raw, "sizing", "min_order_notional_usd", 10.0)),
+        max_order_notional=max_ntl,
+        min_order_notional=min_ntl,
         inventory_scale_bps=float(_get(raw, "inventory", "scale_bps", 10.0)),
         inventory_floor_frac=float(_get(raw, "inventory", "floor_frac", 0.5)),
         premium_persist_sec=float(_get(raw, "execution", "premium_persist_sec", 0.3)),
@@ -408,7 +461,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
-        log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
+        log_level=_validated_log_level(_get(raw, "logging", "level", "INFO")),
         status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),

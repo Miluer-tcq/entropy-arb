@@ -15,8 +15,10 @@ market is not stale, only a dead feed is) and reconnect with backoff.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 from typing import Callable, Optional
 
 try:
@@ -97,11 +99,15 @@ class LighterBookFeed:
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
                     log.info("[%s] connected (%s)", self.name, self.ws_url)
+                    connected_at = time.time()
                     self.book.clear()
                     self._nonce = None
                     self._synced = False
                     async for raw in ws:
-                        backoff = 1.0
+                        # only a long-lived connection resets the backoff —
+                        # a flapping link must not reconnect-storm
+                        if time.time() - connected_at > 60.0:
+                            backoff = 1.0
                         msg = json.loads(raw)
                         t = msg.get("type")
                         self.book.touch()
@@ -124,7 +130,8 @@ class LighterBookFeed:
             self.notify()
             if stop.is_set():
                 break
-            await asyncio.sleep(backoff)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
             backoff = min(backoff * 2, 30.0)
 
 
@@ -174,6 +181,7 @@ class HLBookFeed:
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
                     log.info("[%s] connected (official ws, %s)", self.name, self.coin)
+                    connected_at = time.time()
                     self.book.clear()
                     self._snapped = False
                     await ws.send(json.dumps({
@@ -182,7 +190,10 @@ class HLBookFeed:
                                          "fast": True}}))
                     ptask = asyncio.create_task(self._pinger(ws))
                     async for raw in ws:
-                        backoff = 1.0
+                        # only a long-lived connection resets the backoff —
+                        # a flapping link must not reconnect-storm
+                        if time.time() - connected_at > 60.0:
+                            backoff = 1.0
                         self._on_frame(json.loads(raw))
                         if stop.is_set():
                             break
@@ -194,9 +205,12 @@ class HLBookFeed:
             finally:
                 if ptask is not None:
                     ptask.cancel()
+                    with contextlib.suppress(BaseException):
+                        await ptask
             self.book.ready = False
             self.notify()
             if stop.is_set():
                 break
-            await asyncio.sleep(backoff)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
             backoff = min(backoff * 2, 30.0)

@@ -13,6 +13,7 @@ hides that behind the same result shape the HL venue returns:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ from .feeds import LighterBookFeed
 log = logging.getLogger("lighter")
 
 OPEN_STATUSES = {"in-progress", "pending", "open"}
+TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
 AUTH_REFRESH_SEC = 8 * 60
 REST_TIMEOUT = 10.0
 
@@ -76,8 +78,15 @@ class AccountOrdersFeed:
     def _handle_orders(self, msg: dict) -> None:
         for lst in (msg.get("orders") or {}).values():
             for o in lst or []:
-                status = str(o.get("status", ""))
+                status = str(o.get("status", "")).strip().lower()
                 if status in OPEN_STATUSES:
+                    continue
+                if status not in TERMINAL_STATUSES:
+                    # unknown status: NOT terminal — resolving here with a
+                    # possibly-zero fill would make the bot re-hedge; let
+                    # the settle timeout mark it unresolved instead
+                    log.debug("[%s] unknown order status %r — ignoring",
+                              self.name, status)
                     continue
                 try:
                     coi = int(o.get("client_order_index"))
@@ -100,7 +109,10 @@ class AccountOrdersFeed:
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
                     async for raw in ws:
-                        backoff = 1.0
+                        # only a healthy, long-lived connection resets the
+                        # backoff — a flapping link must not reconnect-storm
+                        if time.time() - connected_at > 60.0:
+                            backoff = 1.0
                         msg = json.loads(raw)
                         t = msg.get("type")
                         if t in ("subscribed/account_orders", "update/account_orders"):
@@ -130,7 +142,8 @@ class AccountOrdersFeed:
                 self.ready.clear()
                 if stop.is_set():
                     break
-                await asyncio.sleep(backoff)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
                 backoff = min(backoff * 2, 30.0)
                 continue
             self.ready.clear()
@@ -284,7 +297,7 @@ class LighterVenue:
         from lighter import SignerClient
         coi = self._next_coi()
         fut = self.orders_feed.watch(coi) if self.orders_feed else None
-        base_amount = int(round(qty * 10 ** self.size_decimals))
+        base_amount = int(qty * 10 ** self.size_decimals + 1e-6)   # floor: never exceed the planned size
         price = int(round(limit_px * 10 ** self.price_decimals))
         try:
             _tx, resp, err = await self.signer.create_order(
@@ -298,14 +311,24 @@ class LighterVenue:
                 reduce_only=reduce_only,
                 order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
             )
+        except asyncio.CancelledError:
+            if fut is not None:
+                self.orders_feed.unwatch(coi)
+            raise
         except Exception as e:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
             msg = f"{type(e).__name__}: {e}"
             if getattr(e, "status", None) == 429 or "(429)" in str(e):
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            # a transport timeout/reset may still have broadcast the tx:
+            # treat it as unknown and let the caller reconcile, never retry
+            # blindly (that would double the position)
+            ambiguous = isinstance(e, (asyncio.TimeoutError, OSError,
+                                       aiohttp.ClientError))
+            return {"status": "send-unknown" if ambiguous else "send-failed",
+                    "filled_base": 0.0, "avg_px": None, "err": msg,
+                    "unresolved": ambiguous}
         if err is not None or (getattr(resp, "code", 200) or 200) != 200:
             if fut is not None:
                 self.orders_feed.unwatch(coi)

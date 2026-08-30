@@ -17,6 +17,7 @@ import aiohttp
 
 from .config import Config
 from .monitor import drift_report, last_row_age_sec
+from .venue_hl import HLVenue   # module import is SDK-free (lazy signer)
 
 _HL_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _HL_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -96,7 +97,10 @@ async def run_preflight(cfg: Config) -> bool:
 
     # ---- SDK imports (live only)
     if live:
-        for mod in ("eth_account", "hyperliquid", "lighter"):
+        mods = ["eth_account", "hyperliquid"]
+        if cfg.hedge.kind == "lighter":
+            mods.append("lighter")   # tradexyz hedge never imports it
+        for mod in mods:
             try:
                 __import__(mod)
                 c.ok(f"SDK import: {mod}")
@@ -147,19 +151,21 @@ async def run_preflight(cfg: Config) -> bool:
                 c.fail("hedge market lookup", repr(e))
 
         # ---- balances vs caps (live only)
-        if live and cfg.entropy.hl_creds \
-                and cfg.entropy.hl_creds.account_address:
-            addr = cfg.entropy.hl_creds.account_address
+        async def _hl_margin_check(conf, tag: str) -> None:
+            """Free margin of one HL dex bucket (+ free spot USDC under the
+            unifiedAccount abstraction) vs the configured caps."""
+            if not (conf.hl_creds and conf.hl_creds.account_address):
+                c.warn(f"{tag} margin", "no account address — balance not "
+                                        "verified")
+                return
+            addr = conf.hl_creds.account_address
             try:
                 async with s.post(cfg.hl_api_url + "/info",
                                   json={"type": "clearinghouseState",
-                                        "user": addr,
-                                        "dex": cfg.entropy.hl_dex},
+                                        "user": addr, "dex": conf.hl_dex},
                                   timeout=t10) as r:
                     st = await r.json()
                 free = float(st.get("withdrawable") or 0.0)
-                # unifiedAccount abstraction: spot USDC directly backs
-                # builder-dex orders, so count free spot USDC as margin.
                 async with s.post(cfg.hl_api_url + "/info",
                                   json={"type": "userAbstraction",
                                         "user": addr},
@@ -171,16 +177,37 @@ async def run_preflight(cfg: Config) -> bool:
                                             "user": addr},
                                       timeout=t10) as r:
                         sp = await r.json()
-                    for b in sp.get("balances") or []:
-                        if b.get("coin") == "USDC":
-                            free += max(float(b.get("total") or 0.0)
-                                        - float(b.get("hold") or 0.0), 0.0)
-                            break
-                label = ("entropy margin (io dex, unified spot)"
-                         if unified else "entropy margin (io dex)")
+                    free += HLVenue.spot_usdc_free(sp.get("balances") or [])
+                label = (f"{tag} margin ({conf.hl_dex or 'main'} dex"
+                         f"{', unified spot' if unified else ''})")
                 _margin_check(c, label, free, cfg)
             except Exception as e:
-                c.fail("entropy balance lookup", repr(e))
+                c.fail(f"{tag} balance lookup", repr(e))
+
+        if live:
+            await _hl_margin_check(cfg.entropy, "entropy")
+
+        if live and cfg.hedge.kind == "hl":
+            # tradexyz hedge: same market + margin checks as the entropy leg
+            try:
+                async with s.post(cfg.hl_api_url + "/info",
+                                  json={"type": "meta",
+                                        "dex": cfg.hedge.hl_dex},
+                                  timeout=t10) as r:
+                    meta = await r.json()
+                names = [a["name"] for a in meta.get("universe") or []]
+                sym = cfg.hedge.symbol
+                hit = next((n for n in names
+                            if n == sym or n.endswith(":" + sym)), None)
+                if hit:
+                    c.ok(f"hedge market {hit} listed on dex "
+                         f"{cfg.hedge.hl_dex}")
+                else:
+                    c.fail(f"hedge symbol {sym} not on dex "
+                           f"{cfg.hedge.hl_dex}")
+            except Exception as e:
+                c.fail("hedge market lookup", repr(e))
+            await _hl_margin_check(cfg.hedge, "hedge")
 
         if live and cfg.hedge.kind == "lighter" and cfg.hedge.lighter_creds:
             try:
@@ -189,9 +216,14 @@ async def run_preflight(cfg: Config) -> bool:
                           "value": str(cfg.hedge.lighter_creds.account_index)}
                 async with s.get(url, params=params, timeout=t10) as r:
                     data = await r.json()
-                acct = (data.get("accounts") or [{}])[0]
-                avail = float(acct.get("available_balance") or 0.0)
-                _margin_check(c, "hedge margin (lighter)", avail, cfg)
+                accounts = data.get("accounts") or []
+                if not accounts:
+                    c.fail("hedge margin (lighter)",
+                           "account not found — check LIGHTER_ACCOUNT_INDEX "
+                           "and that the key belongs to this deployment")
+                else:
+                    avail = float(accounts[0].get("available_balance") or 0.0)
+                    _margin_check(c, "hedge margin (lighter)", avail, cfg)
             except Exception as e:
                 c.fail("hedge balance lookup", repr(e))
 

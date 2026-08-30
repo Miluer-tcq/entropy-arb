@@ -23,7 +23,9 @@ import math
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+_ET = ZoneInfo("America/New_York")   # DST-correct US equity hours
 CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 
 
@@ -61,12 +63,12 @@ def load_rows(path: str, hours: float) -> list:
 
 
 def is_us_session(ts: float) -> bool:
-    """US equity cash hours, 13:30-20:00 UTC Mon-Fri."""
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    """US equity cash hours 09:30-16:00 America/New_York (DST-correct)."""
+    dt = datetime.fromtimestamp(ts, tz=_ET)
     if dt.weekday() >= 5:
         return False
     mins = dt.hour * 60 + dt.minute
-    return 13 * 60 + 30 <= mins < 20 * 60
+    return 9 * 60 + 30 <= mins < 16 * 60
 
 
 def _stats_block(label: str, subset: list, fees: float, midline: float) -> None:
@@ -113,6 +115,7 @@ def main() -> None:
               f"建议至少采集数小时", file=sys.stderr)
         if not rows:
             sys.exit(1)
+    rows.sort(key=lambda r: r["ts"])   # spans/buckets assume time order
 
     span_h = (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0 + 1 / 60.0
     prem = sorted(r["prem"] for r in rows)

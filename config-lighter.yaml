@@ -43,8 +43,9 @@ thresholds:
   upper_bps: 5.0       # entry above midline: sell entropy / 中枢上方入场带宽
   lower_bps: 6.0       # entry below midline: buy entropy / 中枢下方入场带宽
   by_session:
-    start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘
+    start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘（夏令时）
     end_utc: "20:00"     # US regular close 16:00 ET / 美股收盘（周末自动跳过）
+    # 注意：冬令时（约 11 月初–3 月中）为 14:30–21:00 UTC，需手动调整
     midline_bps: -5.7    # 盘中 median -5.70
     upper_bps: 5.5       # 盘中噪声更大，带宽放宽
     lower_bps: 6.5
