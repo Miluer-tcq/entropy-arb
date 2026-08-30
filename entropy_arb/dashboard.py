@@ -77,6 +77,7 @@ _ZH = {
     "mid premium ": "中间价溢价 ",
     "   midline ": "   中枢 ",
     "   band ": "   区间 ",
+    "band": "带宽",
     "   session ": "   时段 ",
     "intraday": "盘中",
     "offhours": "盘外",
@@ -345,7 +346,11 @@ class Dashboard:
         g.add_column(justify="left", style="dim", no_wrap=True)
         g.add_column(justify="left", no_wrap=True)
         g.add_row(self._t("trading session"),
-                  Text(f"{sess_label} [{mid - lo:+.1f} … {mid + up:+.1f}]"))
+                  Text.assemble(
+                      f"{sess_label}  ",
+                      (f"{self._t('band')} +{up:.1f}/−{lo:.1f}", "bold"),
+                      ("  →  ", "dim"),
+                      (f"[{mid - lo:+.1f} … {mid + up:+.1f}]", "cyan")))
         g.add_row(self._t("midline drift (1h)"),
                   Text.assemble(drift_cell, (f" n={n}", "dim")))
         g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()))
