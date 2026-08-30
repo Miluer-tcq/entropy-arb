@@ -44,11 +44,13 @@ thresholds:
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
+  fee_auto: false            # 100% 返还 → 实付 0，禁用交易所费率自动发现
   max_position_usd: 1000     # position cap / 持仓上限（美元）
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
   taker_fee_bps: 1.0         # Lighter venues: 0; tradexyz: ~1.0
+  fee_auto: false            # tradexyz taker ~1.0 bps（HL 费率表）
   max_position_usd: 1000
   max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
