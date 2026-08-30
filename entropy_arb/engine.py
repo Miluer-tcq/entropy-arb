@@ -175,6 +175,11 @@ class Engine:
             getter = getattr(v, "fetch_fee", None)
             if getter is None:
                 continue
+            if not getattr(v.conf, "fee_auto", True):
+                log.info("[%s] fee %.2fbps (config value, auto-discovery "
+                         "off — e.g. 100%% rebated taker fee)", v.name,
+                         v.fee_bps)
+                continue
             try:
                 fee = await getter()
             except Exception as e:

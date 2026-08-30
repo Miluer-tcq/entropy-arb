@@ -72,6 +72,13 @@ thresholds:
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
+  # fee_auto (default true): pull the account's actual taker rate from the
+  # exchange at runtime and override the config value above. Set false when
+  # your fee is fully rebated (charged then refunded) so the engine plans
+  # with 0 — for example a Tier-4 Entropy referral.
+  # fee_auto（默认开）：运行时从交易所拉取账户实际吃单费率并覆盖上面的配置值。
+  # 若你的手续费 100% 返还（先扣后退，实付为 0），设为 false 让引擎按 0 规划。
+  # fee_auto: false
   max_position_usd: 1000     # position cap / 持仓上限（美元）
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 

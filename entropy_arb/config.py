@@ -84,6 +84,7 @@ class VenueConf:
     label: str                # human name for logs, e.g. "ENTROPY", "RH"
     symbol: str
     fee_bps: float
+    fee_auto: bool            # exchange fee discovery on (default)
     cap_usd: float
     orders_per_min: int
     # hl
@@ -175,11 +176,13 @@ _SCHEMA: Dict[str, Any] = {
     "entropy": {
         "dex": str,
         "taker_fee_bps": float,
+        "fee_auto": bool,
         "max_position_usd": float,
         "max_orders_per_min": int,
     },
     "hedge": {
         "taker_fee_bps": float,
+        "fee_auto": bool,
         "max_position_usd": float,
         "max_orders_per_min": int,
     },
@@ -396,6 +399,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         key="entropy", kind="hl", label="ENTROPY",
         symbol=symbol,
         fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
+        fee_auto=bool(_get(raw, "entropy", "fee_auto", True)),
         cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
         orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
         hl_dex=entropy_dex,
@@ -407,6 +411,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             key="hedge", kind="hl", label="XYZ",
             symbol=symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
+            fee_auto=bool(_get(raw, "hedge", "fee_auto", True)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
             hl_dex="xyz",
@@ -420,6 +425,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             label="LIGHTER" if hedge_venue == "lighter" else "RH",
             symbol=symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
+            fee_auto=bool(_get(raw, "hedge", "fee_auto", True)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
             lighter_profile=LIGHTER_PROFILES[hedge_venue],
