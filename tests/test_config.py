@@ -243,6 +243,48 @@ def test_all_day_window_valid():
     assert cfg.windows[0].days == (5, 6) and cfg.windows[0].name == "weekend"
 
 
+def test_auto_midline_tuning_keys():
+    cfg = load("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_midline: true
+  auto_midline_clamp_bps: 5.0
+  auto_midline_hours: 3.0
+""")
+    assert cfg.auto_midline is True
+    assert cfg.auto_midline_clamp_bps == 5.0
+    assert cfg.auto_midline_hours == 3.0
+
+
+def test_auto_midline_tuning_defaults():
+    cfg = load("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+""")
+    assert cfg.auto_midline_clamp_bps == 3.0
+    assert cfg.auto_midline_hours is None          # adaptive
+
+
+def test_auto_midline_clamp_must_be_positive():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_midline_clamp_bps: 0
+""", "auto_midline_clamp_bps must be > 0")
+
+
+def test_auto_midline_hours_must_be_positive():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_midline_hours: -1
+""", "auto_midline_hours must be > 0")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -165,6 +165,8 @@ class Config:
     log_file: str
     # watch / auto-tuning (all opt-in; defaults keep upstream behaviour)
     auto_midline: bool = False
+    auto_midline_clamp_bps: float = 3.0
+    auto_midline_hours: Optional[float] = None   # None = adaptive window
     session_upper_bps: Optional[float] = None
     session_lower_bps: Optional[float] = None
     session_midline_bps: Optional[float] = None
@@ -198,6 +200,8 @@ _SCHEMA: Dict[str, Any] = {
         "upper_bps": float,
         "lower_bps": float,
         "auto_midline": bool,
+        "auto_midline_clamp_bps": float,
+        "auto_midline_hours": float,
         "windows": "list",
         "by_session": {
             "start_utc": str,
@@ -438,6 +442,14 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                           "(the round trip nets upper+lower bps after fees)")
 
     auto_midline = bool(thr.get("auto_midline", False))
+    auto_clamp = float(thr.get("auto_midline_clamp_bps", 3.0))
+    if auto_clamp <= 0:
+        raise ConfigError("thresholds.auto_midline_clamp_bps must be > 0")
+    amh = thr.get("auto_midline_hours")
+    auto_hours = float(amh) if amh is not None else None
+    if auto_hours is not None and auto_hours <= 0:
+        raise ConfigError("thresholds.auto_midline_hours must be > 0 "
+                          "(omit it to let the window adapt itself)")
     sess = thr.get("by_session") or None
     sess_start = sess_end = None
     sess_upper = sess_lower = sess_midline = None
@@ -561,6 +573,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         upper_bps=upper,
         lower_bps=lower,
         auto_midline=auto_midline,
+        auto_midline_clamp_bps=auto_clamp,
+        auto_midline_hours=auto_hours,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,
         session_midline_bps=sess_midline,

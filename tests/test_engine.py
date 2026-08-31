@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -318,6 +319,75 @@ def test_windows_first_match_wins_and_midline_override(monkeypatch):
     _freeze_utc(monkeypatch, weekday=5, hour=19)
     up, lo = eng._band()[1], eng._band()[2]
     assert (up, lo) == (8.0, 3.5)          # weekend all_day catches before any weekday mask could
+
+
+def test_watch_windows_pick_labels(monkeypatch):
+    eng = _make_windows_engine()
+    _freeze_utc(monkeypatch, weekday=4, hour=15)
+    assert eng.session_label() == "regular"
+    _freeze_utc(monkeypatch, weekday=6, hour=3)
+    assert eng.session_label() == "weekend"
+
+
+def _watch_cfg(csv_path, *, auto=True, clamp=5.0, mid=-6.8, hours=None):
+    extra = (f"  auto_midline_clamp_bps: {clamp}\n"
+             + (f"  auto_midline_hours: {hours}\n" if hours else ""))
+    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    f.write(f"""
+thresholds:
+  midline_bps: {mid}
+  upper_bps: 4.0
+  lower_bps: 4.0
+  auto_midline: {"true" if auto else "false"}
+{extra}recorder:
+  enabled: true
+  csv: "{csv_path.replace(os.sep, '/')}"
+""")
+    f.close()
+    cfg = load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter")
+    eng = Engine(cfg)
+    eng.venues = {}
+    eng.midline = cfg.midline_bps
+    return eng
+
+
+def _write_prem_csv(minutes_to_values):
+    f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
+                                    newline="")
+    f.write("minute_ts,premium_close_bps\n")
+    for m, p in sorted(minutes_to_values):        # chronological
+        f.write(f"{time.time() - m * 60},{p}\n")
+    f.close()
+    return f.name
+
+
+def test_watch_tick_snaps_to_stable_regime():
+    csv = _write_prem_csv([(m, -9.2) for m in range(119, 0, -1)])
+    eng = _watch_cfg(csv)
+    asyncio.run(eng._watch_tick())
+    approx(eng.midline, -9.2, tol=0.1)
+
+
+def test_watch_tick_freezes_mid_jump():
+    csv = _write_prem_csv([(m, -6.8) for m in range(300, 35, -1)]
+                          + [(m, -11.5) for m in range(35, 1, -1)])
+    eng = _watch_cfg(csv)
+    asyncio.run(eng._watch_tick())
+    approx(eng.midline, -6.8)                     # unchanged: mid-jump hold
+
+
+def test_watch_tick_clamps_far_regime_to_anchor_edge():
+    csv = _write_prem_csv([(m, -14.0) for m in range(119, 0, -1)])
+    eng = _watch_cfg(csv, clamp=5.0, mid=-6.8)
+    asyncio.run(eng._watch_tick())
+    approx(eng.midline, -11.8)                    # anchor -6.8 minus clamp 5
+
+
+def test_watch_tick_fixed_hours_window():
+    csv = _write_prem_csv([(m, -9.2) for m in range(119, 0, -1)])
+    eng = _watch_cfg(csv, hours=3.0)
+    asyncio.run(eng._watch_tick())
+    approx(eng.midline, -9.2, tol=0.1)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config, window_contains
-from .monitor import drift_report, regime_drift_report
+from .monitor import (auto_midline_target, drift_report, regime_drift_report)
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -793,7 +793,6 @@ class Engine:
         return (em / hm - 1.0) * 1e4
 
     WATCH_INTERVAL_SEC = 60.0
-    AUTO_MIDLINE_CLAMP_BPS = 3.0
 
     async def _watch_loop(self) -> None:
         """Observability loop: funding rates + midline drift, refreshed once
@@ -835,16 +834,29 @@ class Engine:
         self.drift_1h = drift_report(self.cfg.recorder_csv,
                                      self.cfg.midline_bps, 1.0,
                                      min_samples=15)
-        if rreg["median"] is not None and self.cfg.auto_midline:
-            clamped = min(max(rreg["median"],
-                              self.cfg.midline_bps - self.AUTO_MIDLINE_CLAMP_BPS),
-                          self.cfg.midline_bps + self.AUTO_MIDLINE_CLAMP_BPS)
-            if abs(clamped - self.midline) > 1e-9:
-                log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh "
-                            "regime median %+.2f, clamp ±%.1f bps)",
-                            self.midline, clamped, rreg["window_hours"],
-                            rreg["median"], self.AUTO_MIDLINE_CLAMP_BPS)
-                self.midline = clamped
+        if not self.cfg.auto_midline:
+            return
+        # auto-tune against a STABLE regime only: adaptive mode (no explicit
+        # auto_midline_hours) picks the shortest internally-consistent trailing
+        # window and freezes midline while every candidate straddles a jump,
+        # so a wide clamp can never chase a blended, in-between median
+        if self.cfg.auto_midline_hours:
+            rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps,
+                               self.cfg.auto_midline_hours, min_samples=20)
+            target, win = rep["median"], self.cfg.auto_midline_hours
+        else:
+            target, win = auto_midline_target(self.cfg.recorder_csv)
+        if target is None:
+            return
+        clamp = self.cfg.auto_midline_clamp_bps
+        clamped = min(max(target, self.cfg.midline_bps - clamp),
+                      self.cfg.midline_bps + clamp)
+        if abs(clamped - self.midline) > 1e-9:
+            log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh stable "
+                        "median %+.2f, clamp ±%.1f around anchor %+.2f)",
+                        self.midline, clamped, win, target, clamp,
+                        self.cfg.midline_bps)
+            self.midline = clamped
 
     async def _status_loop(self) -> None:
         cfg = self.cfg

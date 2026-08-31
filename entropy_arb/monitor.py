@@ -103,3 +103,37 @@ def regime_drift_report(csv_path: str, midline_bps: float,
             "recent_n": recent["n"], "recent_enough": recent["drift"] is not None,
             "base_median": base["median"], "base_drift": base["drift"],
             "base_n": base["n"], "shifted": shifted}
+
+
+def auto_midline_target(csv_path: str,
+                        candidates=(2.0, 4.0, 6.0, 12.0, 24.0),
+                        min_samples: int = 20,
+                        stability_bps: float = 0.8):
+    """(median, window_hours) of the current stable regime, or (None, None)
+    while mid-shift.
+
+    Walk windows widening from shortest; the first candidate that carries
+    enough SAMPLES is the verdict window:
+      - internally stable (its chronological thirds agree) -> that median is
+        the settled regime, use it (this is what snaps the midline across a
+        day after a jump, once >= a full short window is the new regime);
+      - a third diverges -> we are mid-jump, FROZE (return None) so auto-
+        tuning never chases a blended or diluted median. Longer windows are
+        deliberately NOT consulted here — they merely dilute the fresh jump
+        into an older third and would falsely look stable.
+    Wider windows are only used when a narrower one lacks samples (recorder
+    restart / data gap), so a fresh boot still tunes from a longer tail.
+    """
+    for hours in candidates:
+        xs = read_premium_series(csv_path, hours)
+        if len(xs) < max(min_samples, 18):
+            continue                        # not enough DATA — widen
+        n3 = len(xs) // 3
+        t1, t2, t3 = (median(xs[:n3]), median(xs[n3:2 * n3]),
+                      median(xs[2 * n3:]))
+        if t1 is None or t2 is None or t3 is None:
+            continue
+        if abs(t2 - t1) > stability_bps or abs(t3 - t2) > stability_bps:
+            return None, None               # enough data, but mid-jump: hold
+        return median(xs), hours            # settled on this regime
+    return None, None

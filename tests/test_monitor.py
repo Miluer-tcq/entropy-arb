@@ -9,9 +9,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.monitor import (drift_report, last_row_age_sec,  # noqa: E402
-                                 median, read_premium_series,
-                                 regime_drift_report)
+from entropy_arb.monitor import (auto_midline_target, drift_report,  # noqa: E402
+                                 last_row_age_sec, median,
+                                 read_premium_series, regime_drift_report)
 
 HEADER = "minute_ts,premium_close_bps\n"
 
@@ -82,6 +82,36 @@ def test_regime_drift_falls_back_without_fresh_data():
     assert rep["window_hours"] == 24.0 and not rep["recent_enough"]
     assert abs(rep["drift"]) < 0.5
 
+
+
+def test_auto_midline_picks_shortest_stable_window():
+    # stable single regime across the whole 10h: shortest candidate (2h) wins
+    now = time.time()
+    rows = [(now - m * 60, -6.5) for m in range(120, 1, -1)]   # 2..120min ago, asc
+    med, win = auto_midline_target(write_csv(rows), min_samples=20)
+    assert win == 2.0 and abs(med - (-6.5)) < 0.5
+
+
+def test_auto_midline_freezes_during_regime_jump():
+    # old regime -3.0 fills the 2h window except the newest ~20min, new
+    # regime -8.0 only in the last third: every candidate window's newest
+    # third diverges -> (None, None), auto holds the midline on the blend
+    now = time.time()
+    rows = [(now - m * 60, -3.0) for m in range(300, 35, -1)]
+    rows += [(now - m * 60, -8.0) for m in range(35, 1, -1)]
+    rows.sort(key=lambda x: x[0])            # chronological (recorder appends)
+    med, win = auto_midline_target(write_csv(rows))
+    assert med is None and win is None
+
+
+def test_auto_midline_snaps_after_jump_settles():
+    # new regime -8.0 now covers >2h with 100 samples: the 2h candidate is
+    # internally stable on the NEW regime and the median snaps across at once
+    now = time.time()
+    rows = [(now - m * 60, -3.0) for m in range(600, 120, -1)]
+    rows += [(now - m * 60, -8.0) for m in range(120, 1, -2)]  # 60 pts <2h
+    med, win = auto_midline_target(write_csv(rows), min_samples=20)
+    assert win == 2.0 and abs(med - (-8.0)) < 0.5
 
 
 def test_bad_rows_skipped():
