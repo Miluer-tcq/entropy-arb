@@ -470,6 +470,57 @@ def test_watch_tick_fixed_hours_window():
     approx(eng.midline, -9.2, tol=0.1)
 
 
+def _rising_csv():
+    # 3h of -6.8 then the last 60 min stepped to -4.0: every candidate
+    # window straddles the move -> frozen, with a clear upward drift
+    return _write_prem_csv([(m, -6.8) for m in range(240, 60, -1)]
+                           + [(m, -4.0) for m in range(60, 0, -1)])
+
+
+def test_watch_tick_freeze_sets_drift_lock_and_holds_seed():
+    eng = _watch_cfg(_rising_csv())
+    asyncio.run(eng._watch_tick())          # freeze age 0 < 30 min fallback
+    assert eng._drift_lock == "up"
+    assert eng._frozen_since is not None and not eng._fallback_on
+    approx(eng.midline, -6.8)               # seed untouched while young
+
+
+def test_watch_tick_freeze_fallback_reanchors_from_last_hour():
+    eng = _watch_cfg(_rising_csv(), band=True, floor=2.0, ceiling=8.0)
+    asyncio.run(eng._watch_tick())
+    eng._frozen_since = time.time() - 31 * 60    # age the freeze clock
+    asyncio.run(eng._watch_tick())
+    assert eng._fallback_on and eng._drift_lock == "up"
+    approx(eng.midline, -4.0, tol=0.1)      # last-60-min median, clamp-ok
+    approx(eng.upper, 2.0, tol=0.25)        # edge floor kept it off the seed
+
+
+def test_watch_tick_stable_regime_clears_lock():
+    eng = _watch_cfg(_write_prem_csv([(m, -9.2) for m in range(119, 0, -1)]))
+    eng._frozen_since = 1.0
+    eng._fallback_on = True
+    eng._drift_lock = "up"
+    asyncio.run(eng._watch_tick())
+    assert eng._drift_lock is None and eng._frozen_since is None \
+        and not eng._fallback_on
+    approx(eng.midline, -9.2, tol=0.1)
+
+
+def test_scan_drift_lock_blocks_new_opens_but_never_closes():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.entropy.set_book(100.14, 100.16)    # 14bps rich: sell-entropy signal
+    eng.hedge.set_book(99.99, 100.01)
+    eng._drift_lock = "up"
+    msgs = []
+    eng._skiplog = lambda fmt, *a: msgs.append(fmt % a)
+    assert run_scan(eng) is None            # flat: selling would OPEN a short
+    assert any("drift lock" in m for m in msgs), msgs
+    eng.entropy.position = 0.05             # existing long -> same sell CLOSES
+    best = run_scan(eng)
+    assert best is not None and best[2] is not None
+    assert best[1].key == "entropy"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

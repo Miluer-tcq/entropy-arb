@@ -39,7 +39,7 @@
 # by_session：美股常规时段（含双边扰动）噪声约为盘外的 1.3 倍、中枢整体下移
 # 约 1.5 bps，因此盘中用独立中枢+更宽带；窗口外（含周末休市）用全局带。
 thresholds:
-  midline_bps: -6.8    # 锚点: auto_midline 在锚点±clamp 内自由跟随;跳变超出时手动挪这里
+  midline_bps: -5.0    # 锚点: auto_midline 在锚点±clamp 内自由跟随;跳变超出时手动挪这里
   auto_midline: true
   auto_midline_clamp_bps: 5.0   # 允许范围 [-11.8, -1.8],覆盖 08-30/31 两天全部实测 regime
   # 带宽自动化:同一稳定窗内取"该方向 p90 可执行肉量"作为实时带宽(与 analyze 建议同源)。
@@ -49,6 +49,14 @@ thresholds:
   auto_band_trigger_pct: 10.0   # 每方向 ~10% 分钟触发(对齐 analyze 的建议口径)
   auto_band_floor_bps: 2.5
   auto_band_ceiling_bps: 8.0
+  # 冻结保险(tuner 全程稳定裁决,漂移期冻结):
+  #  1) 冻结期间测 1h 漂移方向,锁死逆漂移的"开新仓"(平旧仓永远放行);
+  #  2) 冻结超过 N 分钟 → 改用最近 60 分钟数据重锚 midline/带宽,不再抱着过时种子。
+  auto_frozen_fallback_min: 30
+  # 执行硬地板:任何一腿计划扣费后的净期望边 < 名义×此bps 一律不开火。
+  # 08-31 实证:漂移期 tuner 冻结 + 旧锚点曾让 24 笔负边 sell 开火,fill 合计 -$0.47;
+  # 回放显示仅此一闸即可把两天 fill 净额从 -$0.09 翻正到 +$0.42(只砍负边,好单不误伤)。
+  min_net_edge_bps: 2.5
   # auto_midline_hours 不填 = 自适应:从 2/4/6/12/24h 里选最短且内部中位数稳定的窗口;
   # 所有候选窗都不稳定(= 正在 regime 跳变)→ 冻结不追,新 regime 攒够 20 分钟自动整体吸附
   upper_bps: 4.0       # 全局带 = 隔夜段(ET 20:00-04:00):σ2.41,卖侧 p90 仅 +0.2 → 上下 4.0
@@ -66,7 +74,7 @@ thresholds:
       start_utc: "13:30"   # ET 09:30 开盘
       end_utc: "20:00"     # ET 16:00 收盘
       days: [0, 1, 2, 3, 4]
-      upper_bps: 5.5   # σ3.30,机会强度全场最高(买p50 已到 10bps)
+      upper_bps: 5.5   # σ3.30,机会强度全场最高(买p50 已到 10bps);地板/带宽兜底,无需拉宽
       lower_bps: 5.5
     - name: premarket
       start_utc: "08:00"   # ET 04:00
@@ -118,8 +126,9 @@ inventory:
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 0       # edge must persist this long before firing / 信号需持续时间
+  premium_persist_sec: 1.2     # edge must persist this long before firing / 信号需持续时间
                                # 0.3s 实测放进"HL急动+Lighter滞后"的幻象价差(36笔 exp+0.56/fill-0.12)
+                               # 08-31 复盘:0.3s 下赢家 exp->fill 中位衰减 72%,1.2s 才滤得掉
   cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
   leg_slippage_bps: 12.0       # taker limit protection per leg / 每腿滑点保护

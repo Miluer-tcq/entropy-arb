@@ -171,6 +171,9 @@ class Config:
     auto_band_trigger_pct: float = 10.0
     auto_band_floor_bps: float = 2.0
     auto_band_ceiling_bps: float = 8.0
+    # minutes of continuous freeze before the tuners re-anchor from the
+    # last 60 min instead of the stale seed (0 = never, pure freeze)
+    auto_frozen_fallback_min: float = 30.0
     # execution safety net: reject any slice whose post-fee expected edge is
     # below this many bps of the slice notional (0 = disabled). Stops the
     # stale-anchor / frozen-tuner case from opening negative-edge trades.
@@ -214,6 +217,7 @@ _SCHEMA: Dict[str, Any] = {
         "auto_band_trigger_pct": float,
         "auto_band_floor_bps": float,
         "auto_band_ceiling_bps": float,
+        "auto_frozen_fallback_min": float,
         "min_net_edge_bps": float,
         "windows": "list",
         "by_session": {
@@ -480,6 +484,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if mne < 0:
         raise ConfigError("thresholds.min_net_edge_bps must be >= 0 "
                           "(0 disables the execution edge floor)")
+    fbf = float(thr.get("auto_frozen_fallback_min", 30.0))
+    if fbf < 0:
+        raise ConfigError("thresholds.auto_frozen_fallback_min must be >= 0 "
+                          "(0 = never fall back from a frozen tuner)")
     sess = thr.get("by_session") or None
     sess_start = sess_end = None
     sess_upper = sess_lower = sess_midline = None
@@ -609,6 +617,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         auto_band_trigger_pct=abtp,
         auto_band_floor_bps=abf,
         auto_band_ceiling_bps=abc,
+        auto_frozen_fallback_min=fbf,
         min_net_edge_bps=mne,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,

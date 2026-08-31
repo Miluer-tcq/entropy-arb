@@ -100,6 +100,14 @@ class Engine:
                                                   "drift": None, "n": 0}
         self.drift_1h: Dict[str, Optional[float]] = {"median": None,
                                                      "drift": None, "n": 0}
+        # frozen-tuner safeguards: when stable_window rejects every window
+        # (slow regime drift), _drift_lock records the direction of travel and
+        # opens AGAINST it are blocked (closes always allowed); after
+        # auto_frozen_fallback_min minutes of continuous freeze the tuners
+        # re-anchor from the last 60 min instead of trading a stale seed.
+        self._frozen_since: Optional[float] = None
+        self._fallback_on = False
+        self._drift_lock: Optional[str] = None
 
     # ------------------------------------------------------------- utilities
 
@@ -448,6 +456,22 @@ class Engine:
         best = None
         for buy, sell, dkey in ((self.hedge, self.entropy, "sell_entropy"),
                                 (self.entropy, self.hedge, "buy_entropy")):
+            # drift lock (frozen tuner, premium trending): block slices that
+            # would OPEN/ADD against the travel; closing an existing position
+            # through the lock is always allowed
+            lock = self._drift_lock
+            if lock == "up" and dkey == "sell_entropy" \
+                    and self.entropy.position <= 0:
+                self._armed[dkey] = None
+                self._skiplog("%s open blocked: drift lock (premium rising)",
+                              dkey)
+                continue
+            if lock == "down" and dkey == "buy_entropy" \
+                    and self.entropy.position >= 0:
+                self._armed[dkey] = None
+                self._skiplog("%s open blocked: drift lock (premium falling)",
+                              dkey)
+                continue
             if not (buy.book.is_fresh(cfg.staleness_sec)
                     and sell.book.is_fresh(cfg.staleness_sec)):
                 continue
@@ -841,6 +865,44 @@ class Engine:
             except asyncio.TimeoutError:
                 pass
 
+    def _freeze_gate(self) -> None:
+        """One watch tick's worth of frozen-tuner bookkeeping: measure the
+        premium's direction of travel (recent 1h vs the hour before it) and
+        arm the open-side lock; start / age the freeze clock and flip on the
+        last-60-min re-anchor fallback once the freeze has run long enough.
+        The lock dies with the freeze — closes are never blocked."""
+        now = time.time()
+        if self._frozen_since is None:
+            self._frozen_since = now
+        rows = read_minute_rows(self.cfg.recorder_csv, 2.0)
+        lock = None
+        if len(rows) >= 30:
+            recent = [r[1] for r in rows if r[0] >= now - 3600.0]
+            prior = [r[1] for r in rows
+                     if now - 7200.0 <= r[0] < now - 3600.0]
+            if len(recent) >= 12 and len(prior) >= 12:
+                d = median(recent) - median(prior)
+                if d > 1.0:
+                    lock = "up"
+                elif d < -1.0:
+                    lock = "down"
+        if lock != self._drift_lock:
+            if lock:
+                log.warning("drift lock ON (%s): opens against the drift are "
+                            "blocked until the regime settles — closes still "
+                            "free", lock)
+            else:
+                log.warning("drift lock OFF: drift stalled inside the "
+                            "stability bar (tuner still frozen)")
+            self._drift_lock = lock
+        fb = self.cfg.auto_frozen_fallback_min
+        if fb > 0 and not self._fallback_on \
+                and now - self._frozen_since >= fb * 60.0:
+            self._fallback_on = True
+            log.warning("tuner frozen >%.0f min -> fallback: re-anchor "
+                        "midline/band from the last 60 min (drift lock %s "
+                        "stays)", fb, self._drift_lock or "off")
+
     async def _watch_tick(self) -> None:
         for v in self.venues.values():
             getter = getattr(v, "fetch_funding", None)
@@ -877,7 +939,20 @@ class Engine:
         else:
             rows, win = stable_window(self.cfg.recorder_csv)
         if not rows or win is None:
-            return
+            # frozen (slow drift / mid-jump): don't chase, but don't trade a
+            # stale seed blindly either — lock opens against the drift and,
+            # after auto_frozen_fallback_min, retune from the last 60 min
+            self._freeze_gate()
+            if not self._fallback_on:
+                return
+            rows = read_minute_rows(self.cfg.recorder_csv, 1.0)
+            if len(rows) < 15:
+                return
+            win = 1.0
+        else:
+            self._frozen_since = None
+            self._fallback_on = False
+            self._drift_lock = None
         if self.cfg.auto_midline:
             target = median([r[1] for r in rows])
             clamp = self.cfg.auto_midline_clamp_bps
