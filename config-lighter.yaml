@@ -39,17 +39,16 @@
 # by_session：美股常规时段（含双边扰动）噪声约为盘外的 1.3 倍、中枢整体下移
 # 约 1.5 bps，因此盘中用独立中枢+更宽带；窗口外（含周末休市）用全局带。
 thresholds:
-  midline_bps: -6.7    # 08-31: 重启后 median -6.69 / σ 1.03（行情已从 -2.4 摆回）
-  upper_bps: 2.5       # analyze 建议（0 费口径，~10% 分钟触发）
-  lower_bps: 2.0
+  midline_bps: -6.4    # 08-31 盘中前: 6h median -6.40 / σ 0.98（放回真中枢,触发即真edge）
+  upper_bps: 3.5       # 卖 Entropy 侧: 当前 regime 无肉（近6h sell_edge>=1.7 为 0/113 分钟）
+  lower_bps: 2.0       # 买 Entropy 侧: 主要机会方向
   by_session:
     start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘（夏令时）
     end_utc: "20:00"     # US regular close 16:00 ET / 美股收盘（周末自动跳过）
     # 注意：冬令时（约 11 月初–3 月中）为 14:30–21:00 UTC，需手动调整
-    # 周一开盘前用 analyze.py 重估盘中中枢（周末中枢已从 -4.3 漂到 -2.5）
-    midline_bps: -5.7    # 盘中 median（08-29 校准）
-    upper_bps: 5.5       # 盘中噪声更大，带宽放宽
-    lower_bps: 6.5
+    midline_bps: -6.4    # 与全局同步:原 -5.7 系 08-29 校准,已过时（regime 跳变两次）
+    upper_bps: 4.0       # 盘中 σ=3.3 ≈ 盘外 1.7-2.0 的 ~1.6 倍 → 带宽 ×1.5-2
+    lower_bps: 3.0
 
 # ======================== VENUES / 交易所参数 ==============================
 entropy:
@@ -63,11 +62,12 @@ hedge:
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   fee_auto: false            # Lighter 本就 0 费；禁用自动发现保持 0
   max_position_usd: 30
-  max_orders_per_min: 120    # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
+  max_orders_per_min: 36     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
-  take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
+  take_fraction: 0.9     # fraction of crossable depth to take / 吃掉可套利深度的比例
+                        # 0.5 时门槛价内侧常只剩第1档 → below_min_notional 静默丢单
   max_order_notional_usd: 10   # per-slice cap / 单笔名义上限（= 交易所最小单）
   min_order_notional_usd: 10   # skip dust / 低于此名义不下单
 
@@ -83,7 +83,7 @@ inventory:
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 1.5    # edge must persist this long before firing / 信号需持续时间
+  premium_persist_sec: 0.3     # edge must persist this long before firing / 信号需持续时间
   cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
   leg_slippage_bps: 50.0       # taker limit protection per leg / 每腿滑点保护

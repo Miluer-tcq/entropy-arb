@@ -463,6 +463,10 @@ class Engine:
                 self._schedule_poke(cfg.premium_persist_sec - (now - armed))
                 continue
             if plan is None:
+                # real edge present (reason was below_min_*) but sizing can't
+                # clear venue minimums — surface it instead of silently dying
+                self._skiplog("%s armed but sizing unusable (%s)", dkey,
+                              reason)
                 continue
             headroom = self._headroom(buy, sell, plan.buy_limit)
             if headroom < plan.buy_notional:
@@ -857,6 +861,19 @@ class Engine:
                 for v in self.venues.values())
             prem = self.premium_bps()
             prem_s = f"{prem:+.2f}" if prem is not None else "—"
+            # executable premiums — what the trigger actually compares, unlike
+            # the mid above: buy pays entropy ask vs hedge bid, sell the reverse
+            try:
+                ea, eb = (self.entropy.book.best_ask(),
+                          self.entropy.book.best_bid())
+                hab, hask = (self.hedge.book.best_bid(),
+                             self.hedge.book.best_ask())
+                ex_b = (ea / hab - 1) * 1e4 if ea and hab else None
+                ex_s = (eb / hask - 1) * 1e4 if eb and hask else None
+                ex_disp = (f" exec {ex_b:+.2f}/{ex_s:+.2f}"
+                           if ex_b is not None and ex_s is not None else "")
+            except (AttributeError, TypeError, ZeroDivisionError):
+                ex_disp = ""
             pos = " ".join(f"{v.name} {v.position:+.6g}"
                            for v in self.venues.values())
             net = sum(v.position for v in self.venues.values())
@@ -864,10 +881,10 @@ class Engine:
             rec = (f" | rec {self.recorder.rows_written} rows"
                    if self.recorder else "")
             mid, up, lo = self._band()
-            log.info("[status] %s | prem %s bps (band %+.2f..%+.2f) | pos %s "
+            log.info("[status] %s | prem %s bps%s (band %+.2f..%+.2f) | pos %s "
                      "net %+.6g | trades %d hedges %d | MTM %s expEdge $%.4f "
                      "fillEdge $%.4f%s%s",
-                     books, prem_s, mid - lo, mid + up,
+                     books, prem_s, ex_disp, mid - lo, mid + up,
                      pos, net, self.trades, self.hedges,
                      f"${pnl:+.4f}" if pnl is not None else "—",
                      self.total_exp_edge, self.total_fill_edge, rec,

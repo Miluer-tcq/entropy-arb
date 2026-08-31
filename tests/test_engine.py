@@ -123,6 +123,18 @@ def test_scan_quiet_inside_band():
     assert run_scan(eng) is None
 
 
+def test_scan_dust_edge_is_logged_not_silent():
+    # real edge clears the hurdle but depth is sub-minimum: must NOT be a
+    # black-hole skip — the below_min reason has to reach the log
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.entropy.set_book(99.94, 99.96, sz=0.04)
+    eng.hedge.set_book(99.99, 100.01, sz=0.04)
+    msgs = []
+    eng._skiplog = lambda fmt, *a: msgs.append(fmt % a)
+    assert run_scan(eng) is None
+    assert any("sizing unusable" in m and "below_min" in m for m in msgs), msgs
+
+
 def test_scan_fires_buy_entropy_below_band():
     eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
     # entropy 5 bps CHEAP (premium -5): below midline-lower=+2 -> buy entropy
