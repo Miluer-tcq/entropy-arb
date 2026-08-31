@@ -42,6 +42,13 @@ thresholds:
   midline_bps: -6.8    # 锚点: auto_midline 在锚点±clamp 内自由跟随;跳变超出时手动挪这里
   auto_midline: true
   auto_midline_clamp_bps: 5.0   # 允许范围 [-11.8, -1.8],覆盖 08-30/31 两天全部实测 regime
+  # 带宽自动化:同一稳定窗内取"该方向 p90 可执行肉量"作为实时带宽(与 analyze 建议同源)。
+  # 上/下限夹取 [2.5, 8.0]:低于地板不配开火(1.8bps 回合费+薄边),高于天花板不如歇着。
+  # 开启后 windows 里的 upper/lower 只作冷启动种子,实盘带以 auto 为准;跳变期同样冻结。
+  auto_band: true
+  auto_band_trigger_pct: 10.0   # 每方向 ~10% 分钟触发(对齐 analyze 的建议口径)
+  auto_band_floor_bps: 2.5
+  auto_band_ceiling_bps: 8.0
   # auto_midline_hours 不填 = 自适应:从 2/4/6/12/24h 里选最短且内部中位数稳定的窗口;
   # 所有候选窗都不稳定(= 正在 regime 跳变)→ 冻结不追,新 regime 攒够 20 分钟自动整体吸附
   upper_bps: 4.0       # 全局带 = 隔夜段(ET 20:00-04:00):σ2.41,卖侧 p90 仅 +0.2 → 上下 4.0
@@ -106,12 +113,12 @@ sizing:
 # 08-31: floor 0 → 0.8。原 0 从第1美元就收"保护费"，$15 仓位即要求 +5bps，
 # 把 7-8bps 的边早早掐死 → 资金利用率减半。0.8 = 前 $24 全额效率，最后20%才抬门槛。
 inventory:
-  scale_bps: 10.0
+  scale_bps: 0
   floor_frac: 0.8
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 1.2     # edge must persist this long before firing / 信号需持续时间
+  premium_persist_sec: 0       # edge must persist this long before firing / 信号需持续时间
                                # 0.3s 实测放进"HL急动+Lighter滞后"的幻象价差(36笔 exp+0.56/fill-0.12)
   cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认

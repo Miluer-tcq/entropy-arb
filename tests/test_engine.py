@@ -329,9 +329,14 @@ def test_watch_windows_pick_labels(monkeypatch):
     assert eng.session_label() == "weekend"
 
 
-def _watch_cfg(csv_path, *, auto=True, clamp=5.0, mid=-6.8, hours=None):
+def _watch_cfg(csv_path, *, auto=True, clamp=5.0, mid=-6.8, hours=None,
+               band=False, trig=10.0, floor=2.0, ceiling=8.0):
     extra = (f"  auto_midline_clamp_bps: {clamp}\n"
-             + (f"  auto_midline_hours: {hours}\n" if hours else ""))
+             + (f"  auto_midline_hours: {hours}\n" if hours else "")
+             + (f"  auto_band: {'true' if band else 'false'}\n"
+                f"  auto_band_trigger_pct: {trig}\n"
+                f"  auto_band_floor_bps: {floor}\n"
+                f"  auto_band_ceiling_bps: {ceiling}\n"))
     f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     f.write(f"""
 thresholds:
@@ -347,6 +352,8 @@ thresholds:
     cfg = load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter")
     eng = Engine(cfg)
     eng.venues = {}
+    eng.entropy = StubVenue("entropy", "ENTROPY")
+    eng.hedge = StubVenue("hedge", "LIGHTER")
     eng.midline = cfg.midline_bps
     return eng
 
@@ -354,9 +361,9 @@ thresholds:
 def _write_prem_csv(minutes_to_values):
     f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
                                     newline="")
-    f.write("minute_ts,premium_close_bps\n")
+    f.write("minute_ts,premium_close_bps,sell_edge_max_bps,buy_edge_max_bps\n")
     for m, p in sorted(minutes_to_values):        # chronological
-        f.write(f"{time.time() - m * 60},{p}\n")
+        f.write(f"{time.time() - m * 60},{p},{p + 2.0},{-p + 2.0}\n")
     f.close()
     return f.name
 
@@ -381,6 +388,57 @@ def test_watch_tick_clamps_far_regime_to_anchor_edge():
     eng = _watch_cfg(csv, clamp=5.0, mid=-6.8)
     asyncio.run(eng._watch_tick())
     approx(eng.midline, -11.8)                    # anchor -6.8 minus clamp 5
+
+
+def _write_edge_csv(fn):
+    """119 minutes, oldest first; fn(m) -> (prem, sell_edge, buy_edge)."""
+    f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
+                                    newline="")
+    f.write("minute_ts,premium_close_bps,sell_edge_max_bps,"
+            "buy_edge_max_bps\n")
+    for m in range(119, 0, -1):
+        p, se, be = fn(m)
+        f.write(f"{time.time() - m * 60},{p},{se},{be}\n")
+    f.close()
+    return f.name
+
+
+def test_watch_tick_band_sets_p90_room():
+    csv = _write_edge_csv(lambda m: (-6.0, -6.0 + m * 0.05, 6.0 + m * 0.03))
+    eng = _watch_cfg(csv, auto=False, band=True, mid=-6.0, floor=2.0,
+                     ceiling=10.0)
+    asyncio.run(eng._watch_tick())
+    approx(eng.upper, 5.4, tol=0.2)          # p90 of i*0.05 rooms
+    approx(eng.lower, 3.24, tol=0.15)
+    mid, up, lo = eng._band()
+    assert up == eng.upper and lo == eng.lower
+
+
+def test_watch_tick_band_respects_floor_and_ceiling():
+    csv = _write_edge_csv(lambda m: (-6.0, -6.0 + m * 0.2, 6.0 + m * 0.01))
+    eng = _watch_cfg(csv, auto=False, band=True, mid=-6.0, floor=2.0,
+                     ceiling=8.0)
+    asyncio.run(eng._watch_tick())
+    assert eng.upper == 8.0 and eng.lower == 2.0
+
+
+def test_watch_tick_band_freezes_mid_jump():
+    # premium jumps in the newest third -> stable_window says hold ->
+    # bands stay at their static seed values
+    def rows(m):
+        prem = -8.0 if m < 35 else -3.0
+        return prem, prem + m * 0.04, -prem + m * 0.04
+    eng = _watch_cfg(_write_edge_csv(rows), auto=False, band=True,
+                     mid=-3.0, floor=2.0, ceiling=10.0)
+    asyncio.run(eng._watch_tick())
+    assert eng.upper == 4.0 and eng.lower == 4.0     # untouched seeds
+
+
+def test_watch_tick_off_when_no_auto():
+    csv = _write_edge_csv(lambda m: (-6.0, -6.0 + m * 0.05, 6.0))
+    eng = _watch_cfg(csv, auto=False, band=False)
+    asyncio.run(eng._watch_tick())
+    assert eng.midline == -6.8 and eng.upper == 4.0
 
 
 def test_watch_tick_fixed_hours_window():

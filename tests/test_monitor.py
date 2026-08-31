@@ -9,9 +9,10 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.monitor import (auto_midline_target, drift_report,  # noqa: E402
-                                 last_row_age_sec, median,
-                                 read_premium_series, regime_drift_report)
+from entropy_arb.monitor import (auto_band_targets, auto_midline_target,  # noqa: E402
+                                 drift_report, last_row_age_sec, median,
+                                 read_premium_series, regime_drift_report,
+                                 stable_window)
 
 HEADER = "minute_ts,premium_close_bps\n"
 
@@ -112,6 +113,34 @@ def test_auto_midline_snaps_after_jump_settles():
     rows += [(now - m * 60, -8.0) for m in range(120, 1, -2)]  # 60 pts <2h
     med, win = auto_midline_target(write_csv(rows), min_samples=20)
     assert win == 2.0 and abs(med - (-8.0)) < 0.5
+
+
+def test_auto_band_targets_percentile_and_fees():
+    # rooms: sell = i*0.05, buy = i*0.03 over 120 stable minutes;
+    # p90 (q=0.9 -> idx 108) = 5.4 / 3.24, minus fees shift
+    rows = [(0.0, -6.0, -6.0 + i * 0.05, 6.0 + i * 0.03)
+            for i in range(120)]
+    up, lo = auto_band_targets(rows, midline_bps=-6.0, fees_bps=0.0,
+                               trigger_pct=10.0)
+    assert abs(up - 5.4) < 1e-9 and abs(lo - 3.24) < 1e-9
+    up2, _ = auto_band_targets(rows, midline_bps=-6.0, fees_bps=1.0)
+    assert abs(up2 - 4.4) < 1e-9
+
+
+def test_stable_window_and_auto_band_over_file():
+    now = time.time()
+    rows = [(now - m * 60, -6.0, -6.0 + (120 - m) * 0.05,
+             6.0 + (120 - m) * 0.03) for m in range(119, 0, -1)]
+    f = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False,
+                                    newline="")
+    f.write("minute_ts,premium_close_bps,sell_edge_max_bps,buy_edge_max_bps\n")
+    for r in rows:
+        f.write("%f,%f,%f,%f\n" % r)
+    f.close()
+    got, win = stable_window(f.name)
+    assert win == 2.0 and len(got) == 119
+    up, lo = auto_band_targets(got, -6.0, 0.0)
+    assert 5.0 < up < 5.5 and 3.0 < lo < 3.3
 
 
 def test_bad_rows_skipped():

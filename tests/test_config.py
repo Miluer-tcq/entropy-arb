@@ -285,6 +285,52 @@ def test_auto_midline_hours_must_be_positive():
 """, "auto_midline_hours must be > 0")
 
 
+def test_auto_band_defaults():
+    cfg = load("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+""")
+    assert cfg.auto_band is False
+    assert cfg.auto_band_trigger_pct == 10.0
+    assert cfg.auto_band_floor_bps == 2.0
+    assert cfg.auto_band_ceiling_bps == 8.0
+
+
+def test_auto_band_keys_parse():
+    cfg = load("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_band: true
+  auto_band_trigger_pct: 12.5
+  auto_band_floor_bps: 2.5
+  auto_band_ceiling_bps: 7.5
+""")
+    assert cfg.auto_band is True
+    assert cfg.auto_band_trigger_pct == 12.5
+    assert (cfg.auto_band_floor_bps, cfg.auto_band_ceiling_bps) == (2.5, 7.5)
+
+
+def test_auto_band_trigger_range():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_band_trigger_pct: 60
+""", "auto_band_trigger_pct must be in")
+
+
+def test_auto_band_ceiling_below_floor():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  auto_band_floor_bps: 5.0
+  auto_band_ceiling_bps: 3.0
+""", "auto_band_ceiling_bps >= floor")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -27,7 +27,8 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config, window_contains
-from .monitor import (auto_midline_target, drift_report, regime_drift_report)
+from .monitor import (auto_band_targets, drift_report, median,
+                      read_minute_rows, regime_drift_report, stable_window)
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -90,6 +91,10 @@ class Engine:
         # watch state — observability (fees/funding/drift); auto_midline is
         # opt-in and clamped, everything else never affects order flow
         self.midline = cfg.midline_bps
+        # live band edges (only used when auto_band; start from the static
+        # global band and get retuned from the stable-regime room stats)
+        self.upper = cfg.upper_bps
+        self.lower = cfg.lower_bps
         self.funding: Dict[str, Optional[float]] = {}
         self.drift: Dict[str, Optional[float]] = {"median": None,
                                                   "drift": None, "n": 0}
@@ -296,13 +301,18 @@ class Engine:
         """Effective (midline, upper_bps, lower_bps). The first window of
         cfg.windows that contains the current UTC instant supplies its band
         (and optionally its own midline); with no match the global values
-        apply."""
+        apply. When auto_band is on, the LIVE data-tuned edges override
+        every static band (window/global); windows still own midlines."""
         cfg = self.cfg
         w = self._active_window()
+        mid = (w.midline_bps
+               if (w is not None and w.midline_bps is not None)
+               else self.midline)
+        if cfg.auto_band:
+            return mid, self.upper, self.lower
         if w is None:
-            return self.midline, cfg.upper_bps, cfg.lower_bps
-        return (w.midline_bps if w.midline_bps is not None else self.midline,
-                w.upper_bps, w.lower_bps)
+            return mid, cfg.upper_bps, cfg.lower_bps
+        return mid, w.upper_bps, w.lower_bps
 
     def session_label(self) -> str:
         """Which threshold set is active right now — for the dashboard.
@@ -834,29 +844,48 @@ class Engine:
         self.drift_1h = drift_report(self.cfg.recorder_csv,
                                      self.cfg.midline_bps, 1.0,
                                      min_samples=15)
-        if not self.cfg.auto_midline:
+        if not (self.cfg.auto_midline or self.cfg.auto_band):
             return
-        # auto-tune against a STABLE regime only: adaptive mode (no explicit
-        # auto_midline_hours) picks the shortest internally-consistent trailing
-        # window and freezes midline while every candidate straddles a jump,
-        # so a wide clamp can never chase a blended, in-between median
+        # Both tuners run on ONE stable-regime window: the first candidate
+        # with enough samples decides. A diverging third (mid-jump) freezes
+        # midline AND bands — chasing a blended median/diluted p90 is how
+        # auto-tuners whipsaw. Fixed auto_midline_hours skips the stability
+        # gate (explicit user choice); missing data widens the window.
         if self.cfg.auto_midline_hours:
-            rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps,
-                               self.cfg.auto_midline_hours, min_samples=20)
-            target, win = rep["median"], self.cfg.auto_midline_hours
+            rows = read_minute_rows(self.cfg.recorder_csv,
+                                    self.cfg.auto_midline_hours)
+            win = self.cfg.auto_midline_hours
         else:
-            target, win = auto_midline_target(self.cfg.recorder_csv)
-        if target is None:
+            rows, win = stable_window(self.cfg.recorder_csv)
+        if not rows or win is None:
             return
-        clamp = self.cfg.auto_midline_clamp_bps
-        clamped = min(max(target, self.cfg.midline_bps - clamp),
-                      self.cfg.midline_bps + clamp)
-        if abs(clamped - self.midline) > 1e-9:
-            log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh stable "
-                        "median %+.2f, clamp ±%.1f around anchor %+.2f)",
-                        self.midline, clamped, win, target, clamp,
-                        self.cfg.midline_bps)
-            self.midline = clamped
+        if self.cfg.auto_midline:
+            target = median([r[1] for r in rows])
+            clamp = self.cfg.auto_midline_clamp_bps
+            clamped = min(max(target, self.cfg.midline_bps - clamp),
+                          self.cfg.midline_bps + clamp)
+            if abs(clamped - self.midline) > 1e-9:
+                log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh "
+                            "stable median %+.2f, clamp ±%.1f around anchor "
+                            "%+.2f)", self.midline, clamped, win, target,
+                            clamp, self.cfg.midline_bps)
+                self.midline = clamped
+        if self.cfg.auto_band:
+            fees = self.entropy.fee_bps + self.hedge.fee_bps
+            up, lo = auto_band_targets(rows, self.midline, fees,
+                                       self.cfg.auto_band_trigger_pct)
+            if up is None:
+                return
+            floor, ceil_ = (self.cfg.auto_band_floor_bps,
+                            self.cfg.auto_band_ceiling_bps)
+            up = min(max(up, floor), ceil_)
+            lo = min(max(lo, floor), ceil_)
+            if abs(up - self.upper) >= 0.25 or abs(lo - self.lower) >= 0.25:
+                log.warning("band auto-adjust +%.2f/-%.2f -> +%.2f/-%.2f bps "
+                            "(p%.0f exec room, %.0fh window, fees %.2f)",
+                            self.upper, self.lower, up, lo,
+                            self.cfg.auto_band_trigger_pct, win, fees)
+                self.upper, self.lower = up, lo
 
     async def _status_loop(self) -> None:
         cfg = self.cfg

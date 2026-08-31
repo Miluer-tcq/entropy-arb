@@ -167,6 +167,14 @@ class Config:
     auto_midline: bool = False
     auto_midline_clamp_bps: float = 3.0
     auto_midline_hours: Optional[float] = None   # None = adaptive window
+    auto_band: bool = False
+    auto_band_trigger_pct: float = 10.0
+    auto_band_floor_bps: float = 2.0
+    auto_band_ceiling_bps: float = 8.0
+    auto_band: bool = False
+    auto_band_trigger_pct: float = 10.0
+    auto_band_floor_bps: float = 2.0
+    auto_band_ceiling_bps: float = 8.0
     session_upper_bps: Optional[float] = None
     session_lower_bps: Optional[float] = None
     session_midline_bps: Optional[float] = None
@@ -202,6 +210,10 @@ _SCHEMA: Dict[str, Any] = {
         "auto_midline": bool,
         "auto_midline_clamp_bps": float,
         "auto_midline_hours": float,
+        "auto_band": bool,
+        "auto_band_trigger_pct": float,
+        "auto_band_floor_bps": float,
+        "auto_band_ceiling_bps": float,
         "windows": "list",
         "by_session": {
             "start_utc": str,
@@ -450,6 +462,16 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if auto_hours is not None and auto_hours <= 0:
         raise ConfigError("thresholds.auto_midline_hours must be > 0 "
                           "(omit it to let the window adapt itself)")
+    auto_band = bool(thr.get("auto_band", False))
+    abtp = float(thr.get("auto_band_trigger_pct", 10.0))
+    if not 1.0 <= abtp <= 50.0:
+        raise ConfigError("thresholds.auto_band_trigger_pct must be in "
+                          "1..50 (share of minutes that should fire)")
+    abf = float(thr.get("auto_band_floor_bps", 2.0))
+    abc = float(thr.get("auto_band_ceiling_bps", 8.0))
+    if abf <= 0 or abc < abf:
+        raise ConfigError("thresholds: auto_band_floor_bps must be > 0 and "
+                          "auto_band_ceiling_bps >= floor")
     sess = thr.get("by_session") or None
     sess_start = sess_end = None
     sess_upper = sess_lower = sess_midline = None
@@ -575,6 +597,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         auto_midline=auto_midline,
         auto_midline_clamp_bps=auto_clamp,
         auto_midline_hours=auto_hours,
+        auto_band=auto_band,
+        auto_band_trigger_pct=abtp,
+        auto_band_floor_bps=abf,
+        auto_band_ceiling_bps=abc,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,
         session_midline_bps=sess_midline,
