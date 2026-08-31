@@ -71,3 +71,35 @@ def drift_report(csv_path: str, midline_bps: float, hours: float = 24.0,
         return {"median": None, "drift": None, "n": len(xs)}
     med = median(xs)
     return {"median": med, "drift": med - midline_bps, "n": len(xs)}
+
+
+def regime_drift_report(csv_path: str, midline_bps: float,
+                        recent_hours: float = 6.0, base_hours: float = 24.0,
+                        min_samples: int = 20) -> dict:
+    """Drift measured against the *current* regime, not a stale blend.
+
+    A single 24h rolling median is a blend of whatever regimes happened to
+    fall inside the window: when the premium jumps (e.g. -2.8 -> -6.4) the
+    blended median sits in nobody's market for up to a day, so a config
+    correctly updated to the new regime would be flagged as drifted. To
+    avoid that, the gate tracks a short recent window and only reports a
+    mismatch against the base window as an informational `shifted` flag.
+
+    Returns {median, drift, n, window_hours} describing the chosen regime
+    window, plus base_*/recent_* detail and `recent_enough`/`shifted`."""
+    recent = drift_report(csv_path, midline_bps, recent_hours,
+                          min_samples=min_samples)
+    base = drift_report(csv_path, midline_bps, base_hours)
+    if recent["drift"] is not None:
+        med, drift, n, window = (recent["median"], recent["drift"],
+                                 recent["n"], recent_hours)
+    else:
+        med, drift, n, window = (base["median"], base["drift"],
+                                 base["n"], base_hours)
+    shifted = (recent["median"] is not None and base["median"] is not None
+               and abs(recent["median"] - base["median"]) >= 3.0)
+    return {"median": med, "drift": drift, "n": n, "window_hours": window,
+            "recent_median": recent["median"], "recent_drift": recent["drift"],
+            "recent_n": recent["n"], "recent_enough": recent["drift"] is not None,
+            "base_median": base["median"], "base_drift": base["drift"],
+            "base_n": base["n"], "shifted": shifted}

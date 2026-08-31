@@ -10,7 +10,8 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.monitor import (drift_report, last_row_age_sec,  # noqa: E402
-                                 median, read_premium_series)
+                                 median, read_premium_series,
+                                 regime_drift_report)
 
 HEADER = "minute_ts,premium_close_bps\n"
 
@@ -53,6 +54,34 @@ def test_drift_not_enough_samples():
 def test_missing_file_is_empty():
     assert read_premium_series("no-such.csv", 1.0) == []
     assert last_row_age_sec("no-such.csv") is None
+
+
+def test_regime_drift_tracks_current_not_blend():
+    # 40 old-regime rows (-2.5) at 8-20h ago (inside 24h, outside 6h) plus 30
+    # new-regime rows (-6.4) at 5-40min ago. The 24h blend sits in nobody's
+    # market; a config set to the NEW regime must not be flagged as drifted.
+    now = time.time()
+    rows = [(now - a, -2.5) for a in range(8 * 3600, 8 * 3600 + 40 * 1080, 1080)]
+    rows += [(now - a, -6.4) for a in range(300, 300 + 30 * 72, 72)]
+    assert len(rows) == 70 and sum(r[1] == -2.5 for r in rows) == 40
+    p = write_csv(rows)
+    rep = regime_drift_report(p, midline_bps=-6.4)
+    assert rep["window_hours"] == 6.0 and rep["recent_enough"]
+    assert abs(rep["drift"]) < 0.5            # recent regime == config
+    assert rep["shifted"] is True             # 24h blend disagrees
+    assert abs(rep["base_drift"]) >= 3.0
+
+
+def test_regime_drift_falls_back_without_fresh_data():
+    # only old-regime data, nothing in the recent window -> can't confirm a
+    # new regime, so fall back to the 24h median and signal not-enough
+    now = time.time()
+    rows = [(now - a, -2.5) for a in range(8 * 3600, 8 * 3600 + 40 * 1080, 1080)]
+    p = write_csv(rows)
+    rep = regime_drift_report(p, midline_bps=-2.5)
+    assert rep["window_hours"] == 24.0 and not rep["recent_enough"]
+    assert abs(rep["drift"]) < 0.5
+
 
 
 def test_bad_rows_skipped():

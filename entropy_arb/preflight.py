@@ -16,7 +16,7 @@ from typing import List, Tuple
 import aiohttp
 
 from .config import Config
-from .monitor import drift_report, last_row_age_sec
+from .monitor import last_row_age_sec, regime_drift_report
 from .venue_hl import HLVenue   # module import is SDK-free (lazy signer)
 
 _HL_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -237,18 +237,31 @@ async def run_preflight(cfg: Config) -> bool:
     else:
         c.ok("recorder data fresh", f"last row {age / 60:.0f}m ago")
 
-    rep = drift_report(cfg.recorder_csv, cfg.midline_bps, 24.0)
+    rep = regime_drift_report(cfg.recorder_csv, cfg.midline_bps)
     if rep["drift"] is None:
         c.warn("midline drift", "not enough recent data to verify")
+    elif abs(rep["drift"]) >= 3.0 and not rep["recent_enough"]:
+        # only the stale 24h blend disagrees — too little fresh data to
+        # tell a real mismatch from a regime shift, so warn instead of halt
+        c.warn("midline drift", f"24h median {rep['base_median']:+.2f} vs "
+                                f"config {cfg.midline_bps:+.2f} — insufficient "
+                                f"fresh data to confirm the current regime")
     elif abs(rep["drift"]) >= 3.0:
-        c.fail("midline drift", f"24h median {rep['median']:+.2f} vs config "
+        c.fail("midline drift", f"current {rep['window_hours']:.0f}h median "
+                                f"{rep['median']:+.2f} vs config "
                                 f"{cfg.midline_bps:+.2f} — update "
                                 f"thresholds.midline_bps")
+    elif rep["shifted"]:
+        c.ok("midline on current regime",
+             f"{rep['window_hours']:.0f}h median {rep['median']:+.2f} bps "
+             f"(24h {rep['base_median']:+.2f} stale — market shifted)")
     elif abs(rep["drift"]) >= 1.5:
-        c.warn("midline drift", f"24h median {rep['median']:+.2f} vs config "
+        c.warn("midline drift", f"{rep['window_hours']:.0f}h median "
+                                f"{rep['median']:+.2f} vs config "
                                 f"{cfg.midline_bps:+.2f} — consider updating")
     else:
-        c.ok("midline on center", f"24h median {rep['median']:+.2f} bps")
+        c.ok("midline on center",
+             f"{rep['window_hours']:.0f}h median {rep['median']:+.2f} bps")
 
     c.print()
     return c.failed == 0

@@ -27,7 +27,7 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
-from .monitor import drift_report
+from .monitor import drift_report, regime_drift_report
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -820,22 +820,26 @@ class Engine:
                 log.debug("[%s] funding fetch failed: %r", v.name, e)
         if not self.cfg.recorder_enabled:
             return
-        rep = drift_report(self.cfg.recorder_csv, self.cfg.midline_bps, 24.0)
-        self.drift = rep
+        # regime-aware drift: track the short recent window so a config
+        # updated to the current market isn't dragged toward a stale 24h
+        # blend during a regime shift; self.drift keeps the 24h view
+        rreg = regime_drift_report(self.cfg.recorder_csv, self.cfg.midline_bps)
+        self.drift = {"median": rreg["base_median"],
+                      "drift": rreg["base_drift"], "n": rreg["base_n"]}
         # 1h display window: only 15 samples required — a fresh restart (or
         # a recorder gap) must not blank the session panel for 30 minutes
         self.drift_1h = drift_report(self.cfg.recorder_csv,
                                      self.cfg.midline_bps, 1.0,
                                      min_samples=15)
-        if rep["drift"] is not None and self.cfg.auto_midline:
-            clamped = min(max(rep["median"],
+        if rreg["median"] is not None and self.cfg.auto_midline:
+            clamped = min(max(rreg["median"],
                               self.cfg.midline_bps - self.AUTO_MIDLINE_CLAMP_BPS),
                           self.cfg.midline_bps + self.AUTO_MIDLINE_CLAMP_BPS)
             if abs(clamped - self.midline) > 1e-9:
-                log.warning("midline auto-adjust %+.2f -> %+.2f bps (24h "
-                            "rolling median %+.2f, clamp ±%.1f bps)",
-                            self.midline, clamped, rep["median"],
-                            self.AUTO_MIDLINE_CLAMP_BPS)
+                log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh "
+                            "regime median %+.2f, clamp ±%.1f bps)",
+                            self.midline, clamped, rreg["window_hours"],
+                            rreg["median"], self.AUTO_MIDLINE_CLAMP_BPS)
                 self.midline = clamped
 
     async def _status_loop(self) -> None:
