@@ -39,9 +39,9 @@
 # by_session：美股常规时段（含双边扰动）噪声约为盘外的 1.3 倍、中枢整体下移
 # 约 1.5 bps，因此盘中用独立中枢+更宽带；窗口外（含周末休市）用全局带。
 thresholds:
-  midline_bps: -2.5    # 08-30 周末: 最近 2h median -2.44 / σ≈1.2（中枢已上漂）
-  upper_bps: 4.0       # 周末 σ 小，带宽从 5/6 收到 4/5（往返净赚 ≥9 bps）
-  lower_bps: 5.0
+  midline_bps: -6.7    # 08-31: 重启后 median -6.69 / σ 1.03（行情已从 -2.4 摆回）
+  upper_bps: 2.5       # analyze 建议（0 费口径，~10% 分钟触发）
+  lower_bps: 2.0
   by_session:
     start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘（夏令时）
     end_utc: "20:00"     # US regular close 16:00 ET / 美股收盘（周末自动跳过）
@@ -63,7 +63,7 @@ hedge:
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   fee_auto: false            # Lighter 本就 0 费；禁用自动发现保持 0
   max_position_usd: 30
-  max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
+  max_orders_per_min: 120    # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
