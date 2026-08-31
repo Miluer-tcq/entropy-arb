@@ -55,21 +55,21 @@ entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
   fee_auto: false            # 100% 返还 → 实付 0，禁用交易所费率自动发现
-  max_position_usd: 30       # 每所 10U 保证金，最高 3x 杠杆
+  max_position_usd: 12       # 12U 余额 = 最多 1 组 $10 往返;改 30 会撞 HL 保证金拒单
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   fee_auto: false            # Lighter 本就 0 费；禁用自动发现保持 0
-  max_position_usd: 30
+  max_position_usd: 12
   max_orders_per_min: 36     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
   take_fraction: 1.0           # fraction of crossable depth to take / 吃掉可套利深度的比例
-                        # 0.9 时要求门槛内深度>=$11.1;薄盘口下全吃 $10 起跳
-  max_order_notional_usd: 10   # per-slice cap / 单笔名义上限（= 交易所最小单）
-  min_order_notional_usd: 10   # skip dust / 低于此名义不下单
+                               # 0.9 时要求门槛内深度>=$11.1;薄盘口下全吃 $10 起跳
+  max_order_notional_usd: 10.01   # per-slice cap / 单笔名义上限（= 交易所最小单）
+  min_order_notional_usd: 10.01   # skip dust / 低于此名义不下单
 
 # ==================== INVENTORY LADDER / 库存阶梯 ==========================
 # Extra bps required once a venue's position passes floor_frac of its cap in
