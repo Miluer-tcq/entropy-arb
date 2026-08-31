@@ -258,6 +258,68 @@ def test_band_offhours_outside_window(monkeypatch):
     assert eng.session_label() == "offhours"
 
 
+WINDOWS_CFG = """
+thresholds:
+  midline_bps: -6.8
+  upper_bps: 4.0
+  lower_bps: 4.0
+  windows:
+    - name: weekend
+      all_day: true
+      days: [5, 6]
+      upper_bps: 8.0
+      lower_bps: 3.5
+    - name: regular
+      start_utc: "13:30"
+      end_utc: "20:00"
+      days: [0, 1, 2, 3, 4]
+      upper_bps: 5.5
+      lower_bps: 5.5
+    - name: premarket
+      start_utc: "08:00"
+      end_utc: "13:30"
+      days: [0, 1, 2, 3, 4]
+      upper_bps: 4.5
+      lower_bps: 4.5
+execution:
+  premium_persist_sec: 0.0
+"""
+
+
+def _make_windows_engine():
+    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    f.write(WINDOWS_CFG)
+    f.close()
+    cfg = load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter")
+    return Engine(cfg)
+
+
+def test_windows_pick_by_phase(monkeypatch):
+    eng = _make_windows_engine()
+    _freeze_utc(monkeypatch, weekday=4, hour=9)     # Fri 09:00Z premarket
+    mid, up, lo = eng._band()
+    assert (up, lo) == (4.5, 4.5) and eng.session_label() == "premarket"
+    _freeze_utc(monkeypatch, weekday=4, hour=15)    # Fri 15:00Z regular
+    mid, up, lo = eng._band()
+    assert (up, lo) == (5.5, 5.5) and eng.session_label() == "regular"
+    _freeze_utc(monkeypatch, weekday=6, hour=2)     # Sun — weekend wins
+    mid, up, lo = eng._band()
+    assert (up, lo) == (8.0, 3.5) and eng.session_label() == "weekend"
+    _freeze_utc(monkeypatch, weekday=3, hour=1)     # Thu 01:00Z -> global
+    mid, up, lo = eng._band()
+    assert (up, lo) == (4.0, 4.0) and eng.session_label() == ""
+    approx(mid, -6.8)
+
+
+def test_windows_first_match_wins_and_midline_override(monkeypatch):
+    # Sat 02:00Z is "weekend" by UTC day; a regular window listing days 5 also
+    # proves ordering matters: weekend entry is first in the list
+    eng = _make_windows_engine()
+    _freeze_utc(monkeypatch, weekday=5, hour=19)
+    up, lo = eng._band()[1], eng._band()[2]
+    assert (up, lo) == (8.0, 3.5)          # weekend all_day catches before any weekday mask could
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -40,21 +40,42 @@
 # 约 1.5 bps，因此盘中用独立中枢+更宽带；窗口外（含周末休市）用全局带。
 thresholds:
   midline_bps: -6.8    # 08-31 16:30 北京(08:30Z)重测:3h median -6.87 σ1.48,6h -6.64 σ1.55
-  upper_bps: 4.0       # p90 可执行空间 sell 4.0 / buy 3.9 → 双边对称 ±4.0,往返净 ≥8bps
+  upper_bps: 4.0       # 全局带 = 隔夜段(ET 20:00-04:00):σ2.41,卖侧 p90 仅 +0.2 → 上下 4.0
   lower_bps: 4.0
-  by_session:
-    start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘（夏令时）
-    end_utc: "20:00"     # US regular close 16:00 ET / 美股收盘（周末自动跳过）
-    # 注意：冬令时（约 11 月初–3 月中）为 14:30–21:00 UTC，需手动调整
-    # 不设 midline_bps → 盘中继承全局 auto/manual 中枢,只加宽带宽
-    upper_bps: 5.0       # 96h 数据:盘中 σ≈盘外 1.35x → 4.0×1.25-1.35
-    lower_bps: 5.0
+  # 五段分档(08-31 用 88h+ 数据实测,美东时段;时间均为 UTC 夏令时换算,
+  # 11-01 美国进入冬令时后下列窗口整体 +1h):
+  #   时段          σ     买边p90  卖边p90  → 带宽取 ~1.5-1.7×σ;卖边无肉的时段把 upper 拉宽"禁用"
+  windows:
+    - name: weekend
+      all_day: true
+      days: [5, 6]
+      upper_bps: 8.0   # 卖边 p90=-0.7 → 实际禁用卖
+      lower_bps: 3.5   # 买边 p90=6.9,σ1.98
+    - name: regular
+      start_utc: "13:30"   # ET 09:30 开盘
+      end_utc: "20:00"     # ET 16:00 收盘
+      days: [0, 1, 2, 3, 4]
+      upper_bps: 5.5   # σ3.30,机会强度全场最高(买p50 已到 10bps)
+      lower_bps: 5.5
+    - name: premarket
+      start_utc: "08:00"   # ET 04:00
+      end_utc: "13:30"     # ET 09:30
+      days: [0, 1, 2, 3, 4]
+      upper_bps: 4.5   # 卖边偶有肉(p99 6.2),样本小先对称微收
+      lower_bps: 4.5
+    - name: postmarket
+      start_utc: "20:00"   # ET 16:00
+      end_utc: "00:00"     # ET 20:00(跨午夜由 wrap 规则处理)
+      days: [0, 1, 2, 3, 4]
+      upper_bps: 8.0   # 卖边 p90=-1.4 → 禁用卖
+      lower_bps: 4.5   # σ3.18,买边 p90 13.1 仍活跃
 
 # ======================== VENUES / 交易所参数 ==============================
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
-  taker_fee_bps: 0.0         # taker fee / 吃单手续费
-  fee_auto: false            # 100% 返还 → 实付 0，禁用交易所费率自动发现
+  taker_fee_bps: 0.9         # 实测 fills API: 0.86 bps/笔(taker 9bps × growth-mode 0.1),保守取 0.9
+                             # “100%返佣”不存在:self-rebate=60%×Entropy 分成的一半,已在成交价外另结
+  fee_auto: false            # 手动实测值;自动发现会读到 4.5bps 基础费率(不含 growth-mode 折扣)
   leverage: 3                # 3x=强平线~33%: 单一股票perp隔夜安全的最后一档,勿再上
   max_position_usd: 30       # 3x 下 $30 名义占 $10 保证金 ≈ 82% 权益;要更多利用率→加本金,别加杠杆
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算

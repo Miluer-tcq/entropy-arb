@@ -20,13 +20,13 @@ import logging
 import os
 import time
 from collections import deque
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
-from .config import Config
+from .config import Config, window_contains
 from .monitor import drift_report, regime_drift_report
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
@@ -284,43 +284,36 @@ class Engine:
 
         return max(ramp(buy, buy.position >= 0), ramp(sell, sell.position <= 0))
 
-    def _band(self) -> tuple:
-        """Effective (midline, upper_bps, lower_bps). The optional by_session
-        block (with its own midline) applies inside its UTC window on
-        weekdays; outside the window — and on weekends, when US equities do
-        not trade — the global values apply."""
-        cfg = self.cfg
-        if cfg.session_upper_bps is None:
-            return self.midline, cfg.upper_bps, cfg.lower_bps
+    def _active_window(self):
+        """First configured window containing now (UTC), or None."""
         now_utc = datetime.now(timezone.utc)
-        if now_utc.weekday() >= 5:  # Sat/Sun: no US equity session
+        for w in self.cfg.windows:
+            if window_contains(w, now_utc):
+                return w
+        return None
+
+    def _band(self) -> tuple:
+        """Effective (midline, upper_bps, lower_bps). The first window of
+        cfg.windows that contains the current UTC instant supplies its band
+        (and optionally its own midline); with no match the global values
+        apply."""
+        cfg = self.cfg
+        w = self._active_window()
+        if w is None:
             return self.midline, cfg.upper_bps, cfg.lower_bps
-        now = now_utc.time()
-        start = dtime.fromisoformat(cfg.session_start_utc)
-        end = dtime.fromisoformat(cfg.session_end_utc)
-        inside = (start <= now < end if start < end
-                  else (now >= start or now < end))
-        if inside:
-            return (cfg.session_midline_bps
-                    if cfg.session_midline_bps is not None else self.midline,
-                    cfg.session_upper_bps, cfg.session_lower_bps)
-        return self.midline, cfg.upper_bps, cfg.lower_bps
+        return (w.midline_bps if w.midline_bps is not None else self.midline,
+                w.upper_bps, w.lower_bps)
 
     def session_label(self) -> str:
         """Which threshold set is active right now — for the dashboard.
-        Empty string when no by_session block is configured."""
-        cfg = self.cfg
-        if cfg.session_upper_bps is None:
+        Empty string when no windows are configured (one global band)."""
+        w = self._active_window()
+        if w is not None:
+            return w.name
+        if not self.cfg.windows_from_session:
             return ""
         now_utc = datetime.now(timezone.utc)
-        if now_utc.weekday() >= 5:
-            return "weekend"
-        now = now_utc.time()
-        start = dtime.fromisoformat(cfg.session_start_utc)
-        end = dtime.fromisoformat(cfg.session_end_utc)
-        inside = (start <= now < end if start < end
-                  else (now >= start or now < end))
-        return "intraday" if inside else "offhours"
+        return "weekend" if now_utc.weekday() >= 5 else "offhours"
 
     def _eff_threshold(self, buy, sell) -> float:
         """Net hurdle (bps, on top of fees) for the direction buy->sell.

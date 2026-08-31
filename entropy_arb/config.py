@@ -22,8 +22,9 @@ Threshold model (fixed numbers the user derives from recorded minute data):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from datetime import time as dtime
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from dotenv import load_dotenv
@@ -97,6 +98,32 @@ class VenueConf:
     lighter_creds: Optional[LighterCreds] = None
 
 
+@dataclass(frozen=True)
+class ThresholdWindow:
+    """One time window with its own band. days uses python weekday
+    (0=Mon .. 6=Sun); all_day ignores start/end. Times are UTC wall-clock,
+    start==end means wrap past midnight when not all_day."""
+    name: str
+    start_utc: Optional[dtime]
+    end_utc: Optional[dtime]
+    days: Tuple[int, ...]
+    upper_bps: float
+    lower_bps: float
+    midline_bps: Optional[float] = None
+    all_day: bool = False
+
+
+def window_contains(w: ThresholdWindow, now_utc) -> bool:
+    if now_utc.weekday() not in w.days:
+        return False
+    if w.all_day:
+        return True
+    t = now_utc.time()
+    if w.start_utc < w.end_utc:
+        return w.start_utc <= t < w.end_utc
+    return t >= w.start_utc or t < w.end_utc   # wraps midnight
+
+
 @dataclass
 class Config:
     symbol: str
@@ -143,6 +170,10 @@ class Config:
     session_midline_bps: Optional[float] = None
     session_start_utc: Optional[str] = None
     session_end_utc: Optional[str] = None
+    # multi-window session bands (US pre/regular/post/overnight/weekend ...):
+    # first matching window wins; legacy by_session is converted to one
+    windows: List["ThresholdWindow"] = field(default_factory=list)
+    windows_from_session: bool = False
     # runtime
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
@@ -167,6 +198,7 @@ _SCHEMA: Dict[str, Any] = {
         "upper_bps": float,
         "lower_bps": float,
         "auto_midline": bool,
+        "windows": "list",
         "by_session": {
             "start_utc": str,
             "end_utc": str,
@@ -275,10 +307,68 @@ def _validate(node: Any, schema: Dict[str, Any], path: str = "") -> None:
         elif want is str:
             if not isinstance(val, str):
                 raise ConfigError(f"'{here}' must be a string, got {val!r}")
+        elif want == "list":
+            if not isinstance(val, list):
+                raise ConfigError(f"'{here}' must be a list, got {val!r}")
 
 
 def _get(d: dict, section: str, key: str, default):
     return (d.get(section) or {}).get(key, default)
+
+
+def _parse_hhmm(hhmm: Any, path: str) -> dtime:
+    parts = str(hhmm).split(":")
+    if (len(parts) != 2 or not all(p.isdigit() and len(p) == 2 for p in parts)
+            or not (0 <= int(parts[0]) <= 23) or not (0 <= int(parts[1]) <= 59)):
+        raise ConfigError(f"{path} must be HH:MM UTC, got {hhmm!r}")
+    return dtime(int(parts[0]), int(parts[1]))
+
+
+_ALL_DAYS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
+
+
+def _parse_window(wd: Any, path: str) -> ThresholdWindow:
+    if not isinstance(wd, dict):
+        raise ConfigError(f"{path} must be a mapping, got {wd!r}")
+    allowed = {"name", "start_utc", "end_utc", "days", "all_day",
+               "midline_bps", "upper_bps", "lower_bps"}
+    for k in wd:
+        if k not in allowed:
+            raise ConfigError(f"unknown config key '{path}.{k}' "
+                              f"(valid: {', '.join(sorted(allowed))})")
+    for k in ("upper_bps", "lower_bps"):
+        if k not in wd:
+            raise ConfigError(f"'{path}.{k}' is required")
+    up, lo = float(wd["upper_bps"]), float(wd["lower_bps"])
+    if up <= 0 or lo <= 0:
+        raise ConfigError(f"{path} upper_bps/lower_bps must be > 0")
+    mid = (float(wd["midline_bps"])
+           if wd.get("midline_bps") is not None else None)
+    all_day = bool(wd.get("all_day", False))
+    days = wd.get("days")
+    if days is None:
+        days_t = _ALL_DAYS
+    else:
+        if (not isinstance(days, list) or not days
+                or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)):
+            raise ConfigError(f"{path}.days must be a non-empty list of "
+                              f"integers 0(Mon)..6(Sun), got {days!r}")
+        days_t = tuple(days)
+    if all_day:
+        start = end = None
+    else:
+        for k in ("start_utc", "end_utc"):
+            if k not in wd:
+                raise ConfigError(f"'{path}.{k}' is required unless all_day")
+        start = _parse_hhmm(wd["start_utc"], f"{path}.start_utc")
+        end = _parse_hhmm(wd["end_utc"], f"{path}.end_utc")
+        if start == end:
+            raise ConfigError(f"{path} start_utc == end_utc is ambiguous — "
+                              f"use all_day: true for an all-day window")
+    return ThresholdWindow(name=str(wd.get("name") or "window"),
+                           start_utc=start, end_utc=end, days=days_t,
+                           upper_bps=up, lower_bps=lo, midline_bps=mid,
+                           all_day=all_day)
 
 
 # ------------------------------------------------------------------ env layer
@@ -378,6 +468,28 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                               "by_session block for one band around the "
                               "clock, or fix the times")
 
+    win_raw = thr.get("windows")
+    windows: List[ThresholdWindow] = []
+    from_session = False
+    if win_raw is not None and sess is not None:
+        raise ConfigError("thresholds: configure either 'windows' or legacy "
+                          "'by_session', not both / 二选一")
+    if win_raw is not None:
+        if not win_raw:
+            raise ConfigError("thresholds.windows is empty — remove it to "
+                              "use one global band")
+        windows = [_parse_window(w, f"thresholds.windows[{i}]")
+                   for i, w in enumerate(win_raw)]
+    elif sess is not None:
+        windows = [ThresholdWindow(
+            name="intraday",
+            start_utc=_parse_hhmm(sess_start, "thresholds.by_session"),
+            end_utc=_parse_hhmm(sess_end, "thresholds.by_session"),
+            days=(0, 1, 2, 3, 4),
+            upper_bps=sess_upper, lower_bps=sess_lower,
+            midline_bps=sess_midline)]
+        from_session = True
+
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
     if not 0.0 < take_fraction <= 1.0:
         raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
@@ -452,6 +564,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,
         session_midline_bps=sess_midline,
+        windows=windows,
+        windows_from_session=from_session,
         session_start_utc=sess_start,
         session_end_utc=sess_end,
         take_fraction=take_fraction,

@@ -168,6 +168,81 @@ def test_session_nonpositive_band():
 """, "by_session upper_bps/lower_bps must be > 0")
 
 
+def test_window_bad_days():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  windows:
+    - start_utc: "13:30"
+      end_utc: "20:00"
+      days: [1, 8]
+      upper_bps: 7.0
+      lower_bps: 7.0
+""", ".days must be a non-empty list")
+
+
+def test_window_start_eq_end_rejected():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  windows:
+    - start_utc: "13:30"
+      end_utc: "13:30"
+      upper_bps: 7.0
+      lower_bps: 7.0
+""", "start_utc == end_utc is ambiguous")
+
+
+def test_window_unknown_key():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  windows:
+    - start_utc: "13:30"
+      end_utc: "20:00"
+      upper_bps: 7.0
+      lower_bps: 7.0
+      spop: 3
+""", "unknown config key")
+
+
+def test_windows_and_by_session_exclusive():
+    expect_error("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  by_session:
+    start_utc: "13:30"
+    end_utc: "20:00"
+    upper_bps: 7.0
+    lower_bps: 7.0
+  windows:
+    - start_utc: "13:30"
+      end_utc: "20:00"
+      upper_bps: 7.0
+      lower_bps: 7.0
+""", "either 'windows' or legacy")
+
+
+def test_all_day_window_valid():
+    cfg = load("""thresholds:
+  midline_bps: -4.6
+  upper_bps: 5.0
+  lower_bps: 6.0
+  windows:
+    - name: weekend
+      all_day: true
+      days: [5, 6]
+      upper_bps: 8.0
+      lower_bps: 3.5
+""")
+    assert len(cfg.windows) == 1 and cfg.windows[0].all_day
+    assert cfg.windows[0].days == (5, 6) and cfg.windows[0].name == "weekend"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
