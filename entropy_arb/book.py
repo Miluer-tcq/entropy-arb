@@ -83,6 +83,10 @@ def floor_step(x: float, step: float) -> float:
     return round(math.floor(x / step + 1e-9) * step, 12)
 
 
+def ceil_step(x: float, step: float) -> float:
+    return round(math.ceil(x / step - 1e-9) * step, 12)
+
+
 def crossable_base(asks: List[Level], bids: List[Level], threshold: float,
                    buy_fee: float = 0.0, sell_fee: float = 0.0) -> Tuple[float, float]:
     """Walk both books level by level and return (base qty, buy notional) that
@@ -176,6 +180,16 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
         return None, "no_edge"
     target = min(q_max * take_fraction, cap_notional / asks[0][0])
     target = floor_step(target, size_step)
+    if target * asks[0][0] < min_notional:
+        # floor_step can shave the last cent off a just-legal slice (top-of-
+        # book depth is plenty, but rounded qty values at $9.88): bump up to
+        # the smallest step that clears the venue minimum when the crossing
+        # genuinely carries that size — but one step of tolerance only, never
+        # reviving a slice the notional cap had legitimately refused
+        bumped = ceil_step(min_notional / asks[0][0], size_step)
+        if bumped <= q_max and bumped * asks[0][0] <= cap_notional \
+                + size_step * asks[0][0] + 1e-9:
+            target = bumped
     if target < min_base:
         return None, "below_min_base"
     buy_limit, buy_notional = walk_depth(asks, target)

@@ -135,6 +135,25 @@ def test_scan_dust_edge_is_logged_not_silent():
     assert any("sizing unusable" in m and "below_min" in m for m in msgs), msgs
 
 
+def test_plan_clears_min_notional_after_step_floor():
+    # the production trap: px 1474.5, step 1e-4, cap == min == $10 makes
+    # floor_step(10/px) * px = $9.88 -> below_min_notional forever, even
+    # though the top of book carries hundreds of dollars
+    from entropy_arb.book import OrderBook, plan_arb
+    buy, sell = OrderBook(), OrderBook()
+    buy.apply_hl([[{"px": "1460.0", "sz": "1.0"}],
+                  [{"px": "1474.5", "sz": "0.32"}]])
+    sell.apply_hl([[{"px": "1475.8", "sz": "5.0"}],
+                   [{"px": "1475.7", "sz": "20.0"}]])
+    plan, reason = plan_arb(buy, sell, threshold_bps=2.0, buy_fee_bps=0.0,
+                            sell_fee_bps=0.0, take_fraction=1.0,
+                            cap_notional=10.0, min_base=1e-4,
+                            min_notional=10.0, size_step=1e-4)
+    assert reason == "ok", reason
+    assert plan.buy_notional >= 10.0 and plan.sell_notional >= 10.0
+    assert plan.qty == 0.0068
+
+
 def test_scan_fires_buy_entropy_below_band():
     eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
     # entropy 5 bps CHEAP (premium -5): below midline-lower=+2 -> buy entropy
