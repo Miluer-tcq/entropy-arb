@@ -66,8 +66,8 @@ hedge:
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
-  take_fraction: 0.9     # fraction of crossable depth to take / 吃掉可套利深度的比例
-                        # 0.5 时门槛价内侧常只剩第1档 → below_min_notional 静默丢单
+  take_fraction: 1.0           # fraction of crossable depth to take / 吃掉可套利深度的比例
+                        # 0.9 时要求门槛内深度>=$11.1;薄盘口下全吃 $10 起跳
   max_order_notional_usd: 10   # per-slice cap / 单笔名义上限（= 交易所最小单）
   min_order_notional_usd: 10   # skip dust / 低于此名义不下单
 
