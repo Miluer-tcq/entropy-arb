@@ -354,6 +354,15 @@ class Engine:
             size_step=self._step,
         )
 
+    def _below_floor(self, plan) -> bool:
+        """True when a fee-clearing slice's post-fee expected edge is thinner
+        than cfg.min_net_edge_bps of its notional — the decay/stale-anchor
+        guard that keeps the engine from paying to open a position."""
+        floor = self.cfg.min_net_edge_bps
+        if floor <= 0 or plan is None:
+            return False
+        return plan.exp_edge_usd < plan.buy_notional * floor / 1e4
+
     # -------------------------------------------------------------- strategy
 
     async def _strategy_loop(self) -> None:
@@ -462,6 +471,16 @@ class Engine:
             if not edge_present:
                 self._armed[dkey] = None
                 continue
+            if plan is not None and self._below_floor(plan):
+                # a real (fee-clearing) edge that is too thin to survive the
+                # observed plan->fill decay, or that only clears because the
+                # midline anchor went stale mid-drift: disarm, do not fire
+                self._armed[dkey] = None
+                self._skiplog("%s edge %.1fbps below min_net_edge floor %.1f "
+                              "— skipped", dkey,
+                              plan.exp_edge_usd / max(plan.buy_notional, 1e-9)
+                              * 1e4, cfg.min_net_edge_bps)
+                continue
             armed = self._armed.get(dkey)
             if armed is None:
                 # premium persistence: only fire if the edge survives
@@ -482,7 +501,7 @@ class Engine:
             if headroom < plan.buy_notional:
                 plan, _ = self._plan(buy, sell,
                                      min(cfg.max_order_notional, headroom))
-                if plan is None:
+                if plan is None or self._below_floor(plan):
                     self._skiplog("%s blocked by position caps (headroom $%.0f)",
                                   dkey, max(headroom, 0.0))
                     continue

@@ -295,6 +295,7 @@ def test_auto_band_defaults():
     assert cfg.auto_band_trigger_pct == 10.0
     assert cfg.auto_band_floor_bps == 2.0
     assert cfg.auto_band_ceiling_bps == 8.0
+    assert cfg.min_net_edge_bps == 0.0
 
 
 def test_auto_band_keys_parse():
@@ -329,6 +330,25 @@ def test_auto_band_ceiling_below_floor():
   auto_band_floor_bps: 5.0
   auto_band_ceiling_bps: 3.0
 """, "auto_band_ceiling_bps >= floor")
+
+
+def test_min_net_edge_bps_parse():
+    cfg = load("""thresholds:
+  midline_bps: -5.0
+  upper_bps: 5.0
+  lower_bps: 5.0
+  min_net_edge_bps: 2.5
+""")
+    assert cfg.min_net_edge_bps == 2.5
+
+
+def test_min_net_edge_bps_rejects_negative():
+    expect_error("""thresholds:
+  midline_bps: -5.0
+  upper_bps: 5.0
+  lower_bps: 5.0
+  min_net_edge_bps: -1.0
+""", "min_net_edge_bps must be >= 0")
 
 
 if __name__ == "__main__":

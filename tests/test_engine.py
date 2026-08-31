@@ -17,14 +17,16 @@ from entropy_arb.engine import Engine  # noqa: E402
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
 
-def make_cfg(midline=5.0, upper=4.0, lower=3.0):
+def make_cfg(midline=5.0, upper=4.0, lower=3.0, min_net_edge=None):
+    floor_line = (f"  min_net_edge_bps: {min_net_edge}\n"
+                  if min_net_edge is not None else "")
     f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     f.write(f"""
 thresholds:
   midline_bps: {midline}
   upper_bps: {upper}
   lower_bps: {lower}
-execution:
+{floor_line}execution:
   premium_persist_sec: 0.0
 """)
     f.close()
@@ -51,7 +53,8 @@ class StubVenue:
 
 
 def make_engine(**thr):
-    cfg = make_cfg(**thr)
+    min_net_edge = thr.pop("min_net_edge", None)
+    cfg = make_cfg(min_net_edge=min_net_edge, **thr)
     eng = Engine(cfg)
     eng.entropy = StubVenue("entropy", "ENTROPY")
     eng.hedge = StubVenue("hedge", "RH")
@@ -122,6 +125,25 @@ def test_scan_quiet_inside_band():
     eng.entropy.set_book(100.04, 100.06)
     eng.hedge.set_book(99.99, 100.01)
     assert run_scan(eng) is None
+
+
+def test_min_net_edge_floor_blocks_thin_but_over_band():
+    # entropy clears the band (>9bps) so the signal fires, but its ~13bps
+    # post-fee edge is below a 20bps floor: the engine must refuse to pay
+    # to open — the 08-31 stale-anchor negative-edge-sell guard.
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, min_net_edge=20.0)
+    eng.entropy.set_book(100.14, 100.16)   # ~13bps rich vs hedge 100.01 ask
+    eng.hedge.set_book(99.99, 100.01)
+    msgs = []
+    eng._skiplog = lambda fmt, *a: msgs.append(fmt % a)
+    assert run_scan(eng) is None
+    assert any("min_net_edge floor" in m for m in msgs), msgs
+    # the same book fires once the floor drops under the real edge
+    eng2 = make_engine(midline=5.0, upper=4.0, lower=3.0, min_net_edge=5.0)
+    eng2.entropy.set_book(100.14, 100.16)
+    eng2.hedge.set_book(99.99, 100.01)
+    best = run_scan(eng2)
+    assert best is not None and best[2].exp_edge_usd > 0
 
 
 def test_scan_dust_edge_is_logged_not_silent():
