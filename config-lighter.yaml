@@ -39,38 +39,38 @@
 # by_session：美股常规时段（含双边扰动）噪声约为盘外的 1.3 倍、中枢整体下移
 # 约 1.5 bps，因此盘中用独立中枢+更宽带；窗口外（含周末休市）用全局带。
 thresholds:
-  midline_bps: -6.4    # 08-31 盘中前: 6h median -6.40 / σ 0.98（放回真中枢,触发即真edge）
+  midline_bps: -6.7    # 08-31 盘中前: 6h median -6.40 / σ 0.98（放回真中枢,触发即真edge）
   upper_bps: 3.5       # 卖 Entropy 侧: 当前 regime 无肉（近6h sell_edge>=1.7 为 0/113 分钟）
-  lower_bps: 2.0       # 买 Entropy 侧: 主要机会方向
+  lower_bps: 3.5       # 买 Entropy 侧: 主要机会方向
   by_session:
     start_utc: "13:30"   # US regular open 09:30 ET / 美股开盘（夏令时）
     end_utc: "20:00"     # US regular close 16:00 ET / 美股收盘（周末自动跳过）
     # 注意：冬令时（约 11 月初–3 月中）为 14:30–21:00 UTC，需手动调整
-    midline_bps: -6.4    # 与全局同步:原 -5.7 系 08-29 校准,已过时（regime 跳变两次）
-    upper_bps: 4.0       # 盘中 σ=3.3 ≈ 盘外 1.7-2.0 的 ~1.6 倍 → 带宽 ×1.5-2
-    lower_bps: 3.0
+    # 不设 midline_bps → 盘中继承全局 auto/manual 中枢,只加宽带宽
+    upper_bps: 5.0       # 盘中 σ≈1.5x → 带宽同步放大(数据:盘中 sell/buy room ~1.5-1.7x)
+    lower_bps: 5.0
 
 # ======================== VENUES / 交易所参数 ==============================
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
   fee_auto: false            # 100% 返还 → 实付 0，禁用交易所费率自动发现
-  leverage: 3                # HL isolated 默认 1x=全额保证金;3x → 强平缓冲 33%
-  max_position_usd: 22       # 3x 下 2 组并发($20.06 名义占 ~$6.7 保证金/共 12U)
+  leverage: 3                # 3x=强平线~33%: 单一股票perp隔夜安全的最后一档,勿再上
+  max_position_usd: 30       # 3x 下 $30 名义占 $10 保证金 ≈ 82% 权益;要更多利用率→加本金,别加杠杆
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   fee_auto: false            # Lighter 本就 0 费；禁用自动发现保持 0
-  max_position_usd: 22       # 与 entropy 对称限组数(Lighter 全仓,占用本就小)
-  max_orders_per_min: 36     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
+  max_position_usd: 30       # 网页已调逐仓3x,与HL对称(强平线同~33%);单边强平由引擎delta自动补平
+  max_orders_per_min: 35     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
-  take_fraction: 1.0           # fraction of crossable depth to take / 吃掉可套利深度的比例
+  take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
                                # 0.9 时要求门槛内深度>=$11.1;薄盘口下全吃 $10 起跳
-  max_order_notional_usd: 10.01   # per-slice cap / 单笔名义上限（= 交易所最小单）
-  min_order_notional_usd: 10.01   # skip dust / 低于此名义不下单
+  max_order_notional_usd: 30   # per-slice cap / 单笔名义上限（= 交易所最小单）
+  min_order_notional_usd: 10   # skip dust / 低于此名义不下单
 
 # ==================== INVENTORY LADDER / 库存阶梯 ==========================
 # Extra bps required once a venue's position passes floor_frac of its cap in
@@ -78,16 +78,20 @@ sizing:
 # Slows down one-sided accumulation without hard-stopping the strategy.
 # 当某交易所持仓超过上限的 floor_frac 后，同方向继续加仓需额外溢价，线性增加到
 # 满仓时的 scale_bps。避免单边持仓快速堆满。 scale_bps: 0 disables / 0 为关闭。
+# 08-31: floor 0 → 0.8。原 0 从第1美元就收"保护费"，$15 仓位即要求 +5bps，
+# 把 7-8bps 的边早早掐死 → 资金利用率减半。0.8 = 前 $24 全额效率，最后20%才抬门槛。
 inventory:
   scale_bps: 10.0
-  floor_frac: 0
+  floor_frac: 0.8
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 0.3     # edge must persist this long before firing / 信号需持续时间
+  premium_persist_sec: 1.2     # edge must persist this long before firing / 信号需持续时间
+                               # 0.3s 实测放进"HL急动+Lighter滞后"的幻象价差(36笔 exp+0.56/fill-0.12)
   cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
-  leg_slippage_bps: 50.0       # taker limit protection per leg / 每腿滑点保护
+  leg_slippage_bps: 12.0       # taker limit protection per leg / 每腿滑点保护
+                               # 50→12: 行情瞬时位移>12bps 时放弃追单(追=负edge),没位移的edge照样吃到
   hedge_slippage_bps: 20.0     # price protection on delta hedges / 对冲滑点保护
   net_tolerance_base: 0.001    # max tolerated net delta (base units) / 允许的净敞口
   max_consecutive_errors: 3    # halt after N straight failures / 连续失败 N 次后停机
