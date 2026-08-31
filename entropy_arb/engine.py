@@ -166,6 +166,13 @@ class Engine:
             self.hedge.init_signer()
             if self.hedge.kind == "hl":
                 self.entropy.share_nonces_with(self.hedge)
+            for v in (self.entropy, self.hedge):
+                setter = getattr(v, "apply_leverage", None)
+                if setter is not None:
+                    try:
+                        await setter()
+                    except Exception as e:
+                        log.warning("[%s] apply_leverage failed: %r", v.name, e)
         if (self.hedge.kind == "hl"
                 and self.entropy._query_address()
                 and self.entropy._query_address() == self.hedge._query_address()):

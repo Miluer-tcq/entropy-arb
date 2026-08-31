@@ -176,6 +176,36 @@ class HLVenue:
 
     # ------------------------------------------------------------- execution
 
+    async def apply_leverage(self) -> None:
+        """Declare this asset's isolated leverage (HL defaults isolated-only
+        assets to 1x, which locks full notional as margin). Idempotent; a
+        rejected update only logs — order flow never depends on it."""
+        lev = int(getattr(self.conf, "hl_leverage", 1) or 1)
+        if lev <= 1 or self.account is None or self.asset_id < 0:
+            return
+        s = self._signing
+        action = {"type": "updateLeverage", "asset": self.asset_id,
+                  "isCross": False, "leverage": lev}
+        try:
+            nonce = self.account.nonces.next()
+            sig = s.sign_l1_action(self.account.wallet, action, None, nonce,
+                                   None, self.account.is_mainnet)
+            payload = {"action": action, "nonce": nonce, "signature": sig,
+                       "vaultAddress": None, "expiresAfter": None}
+        except Exception as e:
+            log.warning("[%s] updateLeverage signing failed: %r", self.name, e)
+            return
+        body, err, unresolved = await self._post_exchange(payload)
+        if err or unresolved:
+            log.warning("[%s] updateLeverage(%dx) not confirmed: %s",
+                        self.name, lev, err or "unresolved")
+        elif isinstance(body, dict) and body.get("status") == "err":
+            log.warning("[%s] updateLeverage(%dx) rejected: %s — leaving the "
+                        "venue default in place", self.name, lev,
+                        str(body.get("response"))[:150])
+        else:
+            log.info("[%s] isolated leverage set to %dx", self.name, lev)
+
     def _next_cloid(self):
         from hyperliquid.utils.types import Cloid
         self._cloid += 1

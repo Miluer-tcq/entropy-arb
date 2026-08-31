@@ -89,6 +89,8 @@ class VenueConf:
     orders_per_min: int
     # hl
     hl_dex: str = ""
+    hl_leverage: int = 1      # isolated leverage declared at startup (HL
+                              # defaults isolated assets to 1x = full margin)
     hl_creds: Optional[HLCreds] = None
     # lighter
     lighter_profile: Optional[LighterProfile] = None
@@ -179,12 +181,14 @@ _SCHEMA: Dict[str, Any] = {
         "fee_auto": bool,
         "max_position_usd": float,
         "max_orders_per_min": int,
+        "leverage": int,
     },
     "hedge": {
         "taker_fee_bps": float,
         "fee_auto": bool,
         "max_position_usd": float,
         "max_orders_per_min": int,
+        "leverage": int,
     },
     "sizing": {
         "take_fraction": float,
@@ -403,6 +407,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
         orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
         hl_dex=entropy_dex,
+        hl_leverage=int(_get(raw, "entropy", "leverage", 1)),
         hl_creds=entropy_hl_creds,
     )
 
@@ -415,6 +420,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
             hl_dex="xyz",
+            hl_leverage=int(_get(raw, "hedge", "leverage", 1)),
             hl_creds=HLCreds(
                 _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
                 _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS")),

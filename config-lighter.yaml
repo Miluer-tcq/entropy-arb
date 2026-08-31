@@ -55,13 +55,14 @@ entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
   fee_auto: false            # 100% 返还 → 实付 0，禁用交易所费率自动发现
-  max_position_usd: 12       # 12U 余额 = 最多 1 组 $10 往返;改 30 会撞 HL 保证金拒单
+  leverage: 5                # HL isolated 默认 1x=全额保证金;5x 使每组 $10 只占 $2
+  max_position_usd: 30       # 配 5x:最多 3 组并发,$30 名义占 ~$6 保证金(余量护 delta-neutral 回撤)
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   fee_auto: false            # Lighter 本就 0 费；禁用自动发现保持 0
-  max_position_usd: 12
+  max_position_usd: 30       # Lighter 全仓 IMR~6.6%:$30 名义仅占 ~$2,余额充裕
   max_orders_per_min: 36     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
