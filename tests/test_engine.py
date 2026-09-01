@@ -17,16 +17,19 @@ from entropy_arb.engine import Engine  # noqa: E402
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
 
-def make_cfg(midline=5.0, upper=4.0, lower=3.0, min_net_edge=None):
+def make_cfg(midline=5.0, upper=4.0, lower=3.0, min_net_edge=None,
+             max_top=None):
     floor_line = (f"  min_net_edge_bps: {min_net_edge}\n"
                   if min_net_edge is not None else "")
+    ceil_line = (f"  max_top_premium_bps: {max_top}\n"
+                 if max_top is not None else "")
     f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     f.write(f"""
 thresholds:
   midline_bps: {midline}
   upper_bps: {upper}
   lower_bps: {lower}
-{floor_line}execution:
+{floor_line}{ceil_line}execution:
   premium_persist_sec: 0.0
 """)
     f.close()
@@ -54,7 +57,8 @@ class StubVenue:
 
 def make_engine(**thr):
     min_net_edge = thr.pop("min_net_edge", None)
-    cfg = make_cfg(min_net_edge=min_net_edge, **thr)
+    max_top = thr.pop("max_top", None)
+    cfg = make_cfg(min_net_edge=min_net_edge, max_top=max_top, **thr)
     eng = Engine(cfg)
     eng.entropy = StubVenue("entropy", "ENTROPY")
     eng.hedge = StubVenue("hedge", "RH")
@@ -144,6 +148,33 @@ def test_min_net_edge_floor_blocks_thin_but_over_band():
     eng2.hedge.set_book(99.99, 100.01)
     best = run_scan(eng2)
     assert best is not None and best[2].exp_edge_usd > 0
+
+
+def test_min_net_edge_floor_never_blocks_a_close():
+    # the 09-01 stuck-long lesson: closing inventory must be allowed even
+    # when the plan's edge is thinner than the open floor
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, min_net_edge=20.0)
+    eng.entropy.position = 0.0193        # existing long -> sell CLOSES it
+    eng.entropy.set_book(100.14, 100.16)
+    eng.hedge.set_book(99.99, 100.01)
+    best = run_scan(eng)
+    assert best is not None
+    assert best[1].key == "entropy"
+
+
+def test_max_top_premium_ceiling_blocks_stale_book_trap():
+    # 39bps top premium: one venue's book is lagging a fast move — the fat
+    # "edge" cancels a leg and we hedge naked (09-01: 100% one-leg fill rate
+    # at >=19bps). The ceiling refuses the trap; the 13bps case still fires.
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, max_top=18.0)
+    eng.entropy.set_book(100.40, 100.42)
+    eng.hedge.set_book(99.99, 100.01)
+    msgs = []
+    eng._skiplog = lambda fmt, *a: msgs.append(fmt % a)
+    assert run_scan(eng) is None
+    assert any("stale-book trap" in m for m in msgs), msgs
+    eng.entropy.set_book(100.14, 100.16)   # 13bps: under the ceiling
+    assert run_scan(eng) is not None
 
 
 def test_scan_dust_edge_is_logged_not_silent():

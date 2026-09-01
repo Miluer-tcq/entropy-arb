@@ -495,10 +495,25 @@ class Engine:
             if not edge_present:
                 self._armed[dkey] = None
                 continue
-            if plan is not None and self._below_floor(plan):
+            reducing = (dkey == "sell_entropy"
+                        and self.entropy.position > 0) \
+                or (dkey == "buy_entropy" and self.entropy.position < 0)
+            if plan is not None and cfg.max_top_premium_bps > 0 \
+                    and plan.top_premium_bps > cfg.max_top_premium_bps:
+                # too fat to be real: one side's book is lagging a fast move,
+                # the profitable leg cancels and we pay to hedge the rest
+                # (09-01: every >=19bps signal cancelled one leg)
+                self._armed[dkey] = None
+                self._skiplog("%s top premium %.0fbps over sanity ceiling "
+                              "%.0fbps — stale-book trap, skipped",
+                              dkey, plan.top_premium_bps,
+                              cfg.max_top_premium_bps)
+                continue
+            if plan is not None and not reducing and self._below_floor(plan):
                 # a real (fee-clearing) edge that is too thin to survive the
                 # observed plan->fill decay, or that only clears because the
-                # midline anchor went stale mid-drift: disarm, do not fire
+                # midline anchor went stale mid-drift: disarm, do not fire.
+                # Closes of an existing position are NEVER floor-blocked.
                 self._armed[dkey] = None
                 self._skiplog("%s edge %.1fbps below min_net_edge floor %.1f "
                               "— skipped", dkey,
@@ -525,7 +540,7 @@ class Engine:
             if headroom < plan.buy_notional:
                 plan, _ = self._plan(buy, sell,
                                      min(cfg.max_order_notional, headroom))
-                if plan is None or self._below_floor(plan):
+                if plan is None or (not reducing and self._below_floor(plan)):
                     self._skiplog("%s blocked by position caps (headroom $%.0f)",
                                   dkey, max(headroom, 0.0))
                     continue
@@ -958,7 +973,9 @@ class Engine:
             clamp = self.cfg.auto_midline_clamp_bps
             clamped = min(max(target, self.cfg.midline_bps - clamp),
                           self.cfg.midline_bps + clamp)
-            if abs(clamped - self.midline) > 1e-9:
+            if abs(clamped - self.midline) >= 0.15:
+                # hysteresis: a 1h rolling median crawls ~0.05bps/min during
+                # drift; re-anchoring every tick is log spam, not signal
                 log.warning("midline auto-adjust %+.2f -> %+.2f bps (%.0fh "
                             "stable median %+.2f, clamp ±%.1f around anchor "
                             "%+.2f)", self.midline, clamped, win, target,

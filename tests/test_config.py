@@ -373,6 +373,28 @@ def test_auto_frozen_fallback_min():
 """, "auto_frozen_fallback_min must be >= 0")
 
 
+def test_max_top_premium_bps():
+    cfg = load("""thresholds:
+  midline_bps: -5.0
+  upper_bps: 5.0
+  lower_bps: 5.0
+  max_top_premium_bps: 18
+""")
+    assert cfg.max_top_premium_bps == 18.0
+    cfg = load("""thresholds:
+  midline_bps: -5.0
+  upper_bps: 5.0
+  lower_bps: 5.0
+""")
+    assert cfg.max_top_premium_bps == 0.0
+    expect_error("""thresholds:
+  midline_bps: -5.0
+  upper_bps: 5.0
+  lower_bps: 5.0
+  max_top_premium_bps: -1
+""", "max_top_premium_bps must be >= 0")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
