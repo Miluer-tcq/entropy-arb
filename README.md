@@ -30,9 +30,29 @@ Open-source two-venue perp arbitrage bot. One leg is always **Entropy**
 - **TUI dashboard** — exact terminal fill at any height, CJK-safe log
   wrapping, session panel with live trading-session tag and 1h midline
   drift (English / 中文 via `--cn`).
+- **Data-driven thresholds** — `auto_midline` / `auto_band` re-anchor the
+  center and band edges from the stable-regime window each minute; a slow
+  drift freezes the tuners, arms a drift-lock (no opens against travel) and,
+  after `auto_frozen_fallback_min`, re-anchors from the last 60 min instead
+  of trading a stale seed.
+- **Execution safety gates** — a `min_net_edge_bps` floor (never open below
+  post-fee expected edge, closes exempt), a `max_top_premium_bps` ceiling
+  (big "spreads" that only fill one leg are skipped) and `maker_enabled`:
+  ceiling rejects rest a passive order on the lagging venue and only take
+  the hedge after it prints — capturing fat spreads with maker economics or
+  cancelling at zero cost.
+- **Risk & exit** — realized/unrealized PnL ledger (fees and hedge slippage
+  land in `realized` the moment they are paid), a UTC-day loss breaker that
+  flattens and halts, and band-decoupled exits (`reversion_close_bps`,
+  `timeout_close_min`) so a drifted anchor can never strand inventory.
+- **Resilience** — Hyperliquid `/info` pacing+cache (429-safe), a shared
+  nonce allocator, venue-outage pause/probe, reconcile that never overwrites
+  fresh fills, and a Lighter settle that waits for the account stream to be
+  ready before it can be false-"unresolved".
 - **Data tooling** — 1-minute recorder, session-split analyzer
-  (`tools/analyze.py`), band backtester, drift monitor module — all tested
-  (48 pytest cases).
+  (`tools/analyze.py`), band backtester with live-mirroring gate simulation
+  (`tools/backtest.py`), a funding-vs-basis check (`tools/funding_check.py`),
+  drift monitor module — all tested (119 pytest cases).
 - **Windows wrapper** — `run-live.ps1`: preflight-gated start + auto-restart
   with clean exit-code handling.
 
