@@ -295,8 +295,17 @@ class LighterVenue:
         """Market order with avg-price protection; settle via account ws."""
         assert self.signer is not None
         from lighter import SignerClient
+        feed = self.orders_feed
+        if feed is not None and not feed.ready.is_set():
+            # The account stream just reconnected (auth refresh, ws drop):
+            # a settle update published before the resubscribe completes is
+            # lost forever, and the 10s ws wait only ends in a false
+            # 'unresolved' re-hedge (09-01 03:50 paid for this lesson).
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(feed.ready.wait(), timeout=2.0)
         coi = self._next_coi()
-        fut = self.orders_feed.watch(coi) if self.orders_feed else None
+        fut = (feed.watch(coi)
+               if feed is not None and feed.ready.is_set() else None)
         base_amount = int(qty * 10 ** self.size_decimals + 1e-6)   # floor: never exceed the planned size
         price = int(round(limit_px * 10 ** self.price_decimals))
         try:

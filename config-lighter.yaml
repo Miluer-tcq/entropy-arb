@@ -61,6 +61,12 @@ thresholds:
   # 幻象天花板:顶部可执行价差 > 此bps 的"机会"直接跳过。09-01 实证:
   # 所有 >=19bps 信号全部一条腿 canceled(单边裸仓+白付 hedge),18bps 以内才有双边成交。
   max_top_premium_bps: 18
+  # Maker 阶梯(天花板拦住的大价差不再浪费):把想成交的那条腿(永远是熵腿)
+  # 以 GTC 被动单挂在过时报价上"等回踩"——真错位则成交并免taker费,跳价假象则永不
+  # 成交、超时撤单零成本;成交之后才 taker 补对冲腿,不存在裸腿窗口。
+  # 进程退出/shutdown 自动撤销所有挂单(cancel_resting),不留孤儿单过夜。
+  maker_enabled: true
+  maker_wait_sec: 3.0
   # auto_midline_hours 不填 = 自适应:从 2/4/6/12/24h 里选最短且内部中位数稳定的窗口;
   # 所有候选窗都不稳定(= 正在 regime 跳变)→ 冻结不追,新 regime 攒够 20 分钟自动整体吸附
   upper_bps: 4.0       # 全局带 = 隔夜段(ET 20:00-04:00):σ2.41,卖侧 p90 仅 +0.2 → 上下 4.0
@@ -145,6 +151,14 @@ execution:
   reconcile_sec: 15.0          # on-chain position sync cadence / 链上持仓核对周期
   venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
   http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+  # ---- 09-01 复盘新增:风险与出场解耦 ----
+  daily_max_loss_usd: 0.60     # UTC 日 PnL(实现+浮动,费用在内)跌破 -此值 → 全平+停机
+                               # ≈ 双边权益 2.5%;断路器状态持久化,重启不重置当日计数
+  reversion_close_bps: 1.0     # 持仓的 premium 回到 mid±1bps → 强制平仓不等对面带宽
+                               # (09-01 教训:锚漂移后平仓阈值永远够不着,多单卡一整天)
+  timeout_close_min: 240       # 持仓超 4h 同样触发强平窗口(净边>0 才成交,亏麻不割)
+  min_cross_rounds: 2.0        # 可穿深度 < 2×最小单时拒绝开新仓(0.0066 尾巴单防抖)
+                               # 注:平仓永不受此限,也不受 min_net_edge 地板限制
 
 # ================== DATA RECORDER / 数据采集 ===============================
 # Always-on while the bot runs: samples both real order books 1/sec and

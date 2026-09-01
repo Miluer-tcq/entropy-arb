@@ -15,7 +15,9 @@ Both venues' books are recorded to 1-minute CSV bars throughout.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
+import json
 import logging
 import os
 import time
@@ -25,8 +27,9 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
-from .book import ArbPlan, floor_step, plan_arb
+from .book import ArbPlan, floor_step, plan_arb, walk_depth
 from .config import Config, window_contains
+from .ledger import Ledger
 from .monitor import (auto_band_targets, drift_report, median,
                       read_minute_rows, regime_drift_report, stable_window)
 from .recorder import MinuteRecorder
@@ -77,6 +80,10 @@ class Engine:
         self._min_base = 0.0
         self._min_notional = 10.0
         self._mtm_baseline: Optional[float] = None
+        # maker ladder: _scan stashes a ceiling-rejected plan here for the
+        # strategy loop to rest on the stale venue; only one at a time
+        self._maker_request = None
+        self._maker_task = None
         # proactive per-venue send budget: timestamps of recent order sends
         self._sends: Dict[str, deque] = {}
         # reactive per-venue throttle: venue key -> excluded until
@@ -108,6 +115,16 @@ class Engine:
         self._frozen_since: Optional[float] = None
         self._fallback_on = False
         self._drift_lock: Optional[str] = None
+        # realized/unrealized ledger + UTC-day risk clock (state file keeps
+        # the day's PnL baseline across restarts so the breaker cannot be
+        # reset by bouncing the process)
+        self.ledger = Ledger()
+        self._pnl_state_path = (os.path.splitext(cfg.trades_csv)[0]
+                                + "_pnl.json")
+        self._day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._pnl_anchor = 0.0
+        self._open_since: Optional[float] = None
+        self._load_pnl_state()
 
     # ------------------------------------------------------------- utilities
 
@@ -263,6 +280,15 @@ class Engine:
                      len(self._exec_tasks))
             await asyncio.wait(self._exec_tasks,
                                timeout=cfg.settle_timeout_sec + 2.0)
+        if self._maker_task is not None and not self._maker_task.done():
+            self._maker_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._maker_task
+        for v in self.venues.values():
+            getter = getattr(v, "cancel_resting", None)
+            if getter is not None:
+                with contextlib.suppress(Exception):
+                    await getter()   # no Gtc order may outlive the process
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -350,10 +376,11 @@ class Engine:
         hs = sell.cap_usd + sell.position * ref_px
         return min(hb, hs)
 
-    def _plan(self, buy, sell, cap_notional: float):
+    def _plan(self, buy, sell, cap_notional: float, threshold_bps=None):
         return plan_arb(
             buy.book, sell.book,
-            threshold_bps=self._eff_threshold(buy, sell),
+            threshold_bps=(self._eff_threshold(buy, sell)
+                           if threshold_bps is None else threshold_bps),
             buy_fee_bps=buy.fee_bps, sell_fee_bps=sell.fee_bps,
             take_fraction=self.cfg.take_fraction,
             cap_notional=cap_notional,
@@ -413,6 +440,13 @@ class Engine:
         if now - self.last_trade_ts < cfg.cooldown_sec:
             self._schedule_poke(cfg.cooldown_sec - (now - self.last_trade_ts))
             return
+        if self._maker_request is not None:
+            if (self._maker_task is None
+                    or self._maker_task.done()):   # previous ladder resolved
+                req = self._maker_request
+                self._maker_request = None
+                self._maker_task = asyncio.create_task(self._run_maker(*req))
+            return
         best = self._scan(now)
         if best is None:
             return
@@ -427,6 +461,107 @@ class Engine:
         self._exec_tasks.add(t)
         t.add_done_callback(self._exec_tasks.discard)
         await asyncio.shield(t)
+
+    async def _run_maker(self, dkey: str, plan: ArbPlan, buy, sell) -> None:
+        """Maker ladder for ceiling-rejected signals: rest the leg we WANT
+        to be filled (always the ENTROPY side, the venue whose displayed
+        quote was too good) as a passive Gtc order, and only taker the hedge
+        leg AFTER that fill. If the market pulls back into us we capture the
+        fat spread with maker economics; if it keeps running away, the order
+        never fills and is cancelled — zero cost, no naked window, because
+        the second leg is never touched before the first one prints."""
+        ent = buy if buy.key == "entropy" else sell
+        hed = sell if ent is buy else buy
+        mk_is_buy = dkey == "buy_entropy"
+        mk_qty = floor_step(plan.qty, self._step)
+        mk_px = plan.buy_limit if mk_is_buy else plan.sell_limit
+        if mk_qty < self._min_base or mk_qty * mk_px < self._min_notional:
+            return
+        lk_e = self._vlock(ent.key)
+        lk_h = self._vlock(hed.key)
+        await lk_e.acquire()
+        try:
+            if self.halted or self.stop.is_set():
+                return
+            log.info("[MAKER] %s: rest %s %.6g on %s @%.6g (wait %.1fs)",
+                     dkey, "BUY" if mk_is_buy else "SELL", mk_qty, ent.name,
+                     mk_px, self.cfg.maker_wait_sec)
+            try:
+                res = await ent.send_maker(
+                    is_buy=mk_is_buy, qty=mk_qty, limit_px=mk_px,
+                    wait_sec=self.cfg.maker_wait_sec)
+            except Exception as e:
+                log.error("[MAKER] %s leg failed: %r", ent.name, e)
+                return
+            f = res.get("filled_base") or 0.0
+            if f <= 0:
+                log.info("[MAKER] %s not pulled back (%s) — cancelled, "
+                         "no cost", ent.name, res.get("status"))
+                self._update_evt.set()
+                return
+            epx = res.get("avg_px") or mk_px
+            ent.position += f if mk_is_buy else -f
+            efee = ent.fee_bps / 1e4
+            ent.cash += -f * epx * (1 + efee) if mk_is_buy \
+                else f * epx * (1 - efee)
+            ent.volume_usd += f * epx
+            self.ledger.fill(ent.key, is_buy=mk_is_buy, qty=f, px=epx,
+                             fee_bps=ent.fee_bps)
+        finally:
+            lk_e.release()
+        # maker leg printed: now cross the hedge leg at the CURRENT book.
+        # Fails/decays like any taker fill — residual is handled by the
+        # standard hedge/reconcile path, same as one-leg IOC outcomes.
+        slip = self.cfg.leg_slippage_bps / 1e4
+        ref = hed.book.best_bid() if not mk_is_buy else hed.book.best_ask()
+        hlk = lk_h
+        await hlk.acquire()
+        try:
+            if ref is None or self.halted or self.stop.is_set():
+                status, hfill, hpx = "no-book", 0.0, 0.0
+            else:
+                h_is_buy = not mk_is_buy
+                bound = hed.px_round(ref * (1 + slip) if h_is_buy
+                                     else ref * (1 - slip), h_is_buy)
+                r = await hed.send_taker(is_buy=h_is_buy, qty=f,
+                                         limit_px=bound)
+                hfill = r.get("filled_base") or 0.0
+                hpx = r.get("avg_px") or bound
+                status = r["status"]
+                if hfill:
+                    hfee = hed.fee_bps / 1e4
+                    hed.position += hfill if h_is_buy else -hfill
+                    hed.cash += -hfill * hpx * (1 + hfee) if h_is_buy \
+                        else hfill * hpx * (1 - hfee)
+                    hed.volume_usd += hfill * hpx
+                    self.ledger.fill(hed.key, is_buy=h_is_buy, qty=hfill,
+                                     px=hpx, fee_bps=hed.fee_bps)
+                if r.get("err") or r.get("unresolved"):
+                    self._reconcile_evt.set()
+        finally:
+            hlk.release()
+        matched = min(f, hfill)
+        fill_edge = matched * ((hpx * (1 - hed.fee_bps / 1e4)
+                                - epx * (1 + ent.fee_bps / 1e4))
+                               if mk_is_buy else
+                               (epx * (1 - ent.fee_bps / 1e4)
+                                - hpx * (1 + hed.fee_bps / 1e4)))
+        self.total_fill_edge += fill_edge if matched else 0.0
+        self.trades += 1
+        self.last_trade_ts = time.time()
+        ent.last_traded_ts = hed.last_traded_ts = time.time()
+        log.info("[MAKER DONE] %s: ent %.6g@%.6g (%s) + hedge %.6g@%.6g "
+                 "(%s) | matched %.6g | fill edge $%.4f",
+                 dkey, f, epx, res.get("status"), hfill, hpx, status,
+                 matched, fill_edge)
+        self.recent_trades.append({
+            "ts": time.time(), "direction": dkey + "/maker", "qty": matched,
+            "notional": matched * epx,
+            "prem_bps": plan.top_premium_bps,
+            "exp": None, "fill": fill_edge if matched else None,
+            "status": f"{res.get('status')}/{status}", "ok": bool(matched)})
+        await self._maybe_hedge()
+        self._update_evt.set()
 
     async def _execute_locked(self, buy, sell, plan: ArbPlan) -> None:
         """Run one execution while holding both venue locks (acquired by the
@@ -454,6 +589,28 @@ class Engine:
         (buy, sell, plan), or None."""
         cfg = self.cfg
         best = None
+        # inventory age + decoupled-exit window: closing is triggered by the
+        # mean reversion itself (premium back near mid) or a holding-time
+        # limit, NOT by the opposite band edge — a drifted anchor can push
+        # the exit threshold out of reach for hours (09-01 stuck-long case)
+        pos = self.entropy.position
+        if abs(pos) > cfg.net_tolerance_base:
+            if self._open_since is None:
+                self._open_since = now
+        else:
+            self._open_since = None
+        exit_close = False
+        if abs(pos) > cfg.net_tolerance_base:
+            mid_now = self._band()[0]
+            prem_now = self.premium_bps()
+            if (cfg.timeout_close_min > 0 and self._open_since
+                    and now - self._open_since >= cfg.timeout_close_min * 60):
+                exit_close = True
+            if (cfg.reversion_close_bps > 0 and prem_now is not None
+                    and abs(prem_now - mid_now) <= cfg.reversion_close_bps):
+                exit_close = True
+        exit_dkey = ("sell_entropy" if pos > 0 else "buy_entropy") \
+            if exit_close else None
         for buy, sell, dkey in ((self.hedge, self.entropy, "sell_entropy"),
                                 (self.entropy, self.hedge, "buy_entropy")):
             # drift lock (frozen tuner, premium trending): block slices that
@@ -490,7 +647,9 @@ class Engine:
             if (buy.book.last_update_ts <= buy.last_traded_ts
                     or sell.book.last_update_ts <= sell.last_traded_ts):
                 continue
-            plan, reason = self._plan(buy, sell, cfg.max_order_notional)
+            plan, reason = self._plan(
+                buy, sell, cfg.max_order_notional,
+                threshold_bps=0.0 if dkey == exit_dkey else None)
             edge_present = reason not in ("no_edge", "empty_book")
             if not edge_present:
                 self._armed[dkey] = None
@@ -498,16 +657,41 @@ class Engine:
             reducing = (dkey == "sell_entropy"
                         and self.entropy.position > 0) \
                 or (dkey == "buy_entropy" and self.entropy.position < 0)
+            if (plan is not None and not reducing
+                    and cfg.min_cross_rounds > 0
+                    and plan.q_max_notional
+                    < cfg.min_cross_rounds * self._min_notional):
+                # thin book: the whole crossing is barely one venue minimum —
+                # sizing there just churns dust tails (0.0066 round-trips)
+                self._armed[dkey] = None
+                self._skiplog("%s book too thin: $%.0f crossable < %.0f x "
+                              "min — skipped", dkey, plan.q_max_notional,
+                              cfg.min_cross_rounds)
+                continue
             if plan is not None and cfg.max_top_premium_bps > 0 \
                     and plan.top_premium_bps > cfg.max_top_premium_bps:
-                # too fat to be real: one side's book is lagging a fast move,
-                # the profitable leg cancels and we pay to hedge the rest
-                # (09-01: every >=19bps signal cancelled one leg)
+                # too fat to be real on a taker IOC: one side's book is
+                # lagging a fast move. If maker mode is on, rest a passive
+                # order on the LAGGING side and get paid to be right (only a
+                # real pull-back fills us); else just skip.
                 self._armed[dkey] = None
-                self._skiplog("%s top premium %.0fbps over sanity ceiling "
-                              "%.0fbps — stale-book trap, skipped",
-                              dkey, plan.top_premium_bps,
-                              cfg.max_top_premium_bps)
+                maker_free = (not cfg.maker_enabled
+                              or (self._maker_task is None
+                                  or self._maker_task.done())
+                              ) and not self._maker_request
+                if cfg.maker_enabled and hasattr(self.entropy,
+                                                 "send_maker") \
+                        and maker_free:
+                    self._maker_request = (dkey, plan, buy, sell)
+                    self._schedule_poke(cfg.maker_wait_sec + 1.0)
+                    self._skiplog("%s premium %.0fbps over ceiling — queuing "
+                                  "MAKER ladder instead of taker",
+                                  dkey, plan.top_premium_bps)
+                else:
+                    self._skiplog("%s top premium %.0fbps over sanity ceiling "
+                                  "%.0fbps — stale-book trap, skipped",
+                                  dkey, plan.top_premium_bps,
+                                  cfg.max_top_premium_bps)
                 continue
             if plan is not None and not reducing and self._below_floor(plan):
                 # a real (fee-clearing) edge that is too thin to survive the
@@ -589,10 +773,14 @@ class Engine:
             bpx = binfo.get("avg_px") or plan.buy_limit
             buy.cash -= bfill * bpx * (1 + plan.buy_fee)
             buy.volume_usd += bfill * bpx
+            self.ledger.fill(buy.key, is_buy=True, qty=bfill, px=bpx,
+                             fee_bps=buy.fee_bps)
         if sfill:
             spx = sinfo.get("avg_px") or plan.sell_limit
             sell.cash += sfill * spx * (1 - plan.sell_fee)
             sell.volume_usd += sfill * spx
+            self.ledger.fill(sell.key, is_buy=False, qty=sfill, px=spx,
+                             fee_bps=sell.fee_bps)
 
         matched = min(bfill, sfill)
         fill_edge = 0.0
@@ -703,6 +891,8 @@ class Engine:
                         v.cash += fill * px * (1 - fee) if is_sell \
                             else -fill * px * (1 + fee)
                         v.volume_usd += fill * px
+                        self.ledger.fill(v.key, is_buy=not is_sell, qty=fill,
+                                         px=px, fee_bps=v.fee_bps)
                     log.info("[HEDGE SETTLED] %s %s %.6g/%.6g",
                              v.name, info["status"], fill, qty)
                 v.last_traded_ts = time.time()
@@ -784,6 +974,9 @@ class Engine:
                 if mid is not None:
                     v.cash -= delta * mid
                 v.position = r
+                # fills we did not place (manual trades, missed settles):
+                # cost basis unknown, price the carry at mark
+                self.ledger.reanchor(v.key, r, mid)
 
     async def _reconcile_loop(self) -> None:
         while not self.stop.is_set():
@@ -853,6 +1046,140 @@ class Engine:
         if self._mtm_baseline is None:
             self._mtm_baseline = total
         return total - self._mtm_baseline
+
+    # ------------------------------------------------------------ PnL / risk
+
+    def _marks(self) -> Dict[str, Optional[float]]:
+        return {k: v.book.mid() for k, v in self.venues.items()}
+
+    def day_pnl(self) -> float:
+        """UTC-day PnL (realized + unrealized, fees inside realized),
+        continued across restarts via the small state file."""
+        return self._pnl_anchor + self.ledger.realized() \
+            + self.ledger.unrealized(self._marks())
+
+    def _roll_day(self) -> None:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if day == self._day:
+            return
+        closed = self.day_pnl()
+        log.warning("[pnl] day %s closed at $%+.4f (realized $%+.4f, fees "
+                    "$%.4f) — rolling over / 日切", self._day, closed,
+                    self.ledger.realized(), self.ledger.fees())
+        self._day = day
+        self._pnl_anchor = -(self.ledger.realized()
+                             + self.ledger.unrealized(self._marks()))
+        self._save_pnl_state()
+
+    def _state_dir(self) -> str:
+        d = os.path.dirname(self._pnl_state_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    def _load_pnl_state(self) -> None:
+        try:
+            with open(self._pnl_state_path) as f:
+                st = json.load(f)
+            if st.get("day") == self._day:
+                self._pnl_anchor = float(st.get("anchor", 0.0))
+                log.info("pnl state: continuing UTC day %s at carry $%+.4f",
+                         self._day, self._pnl_anchor)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_pnl_state(self) -> None:
+        try:
+            self._state_dir()
+            tmp = self._pnl_state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"day": self._day,
+                           "anchor": self.day_pnl(),
+                           "realized": self.ledger.realized(),
+                           "fees": self.ledger.fees(),
+                           "ts": time.time()}, f)
+            os.replace(tmp, self._pnl_state_path)
+        except OSError:
+            pass
+
+    async def _risk_check(self) -> None:
+        """Called from the status loop: day rollover, state persist, and the
+        daily drawdown breaker — flatten first, then halt, so a restart
+        cannot be used to keep trading on a blown day."""
+        self._roll_day()
+        self._save_pnl_state()
+        lim = self.cfg.daily_max_loss_usd
+        if lim > 0 and not self.halted:
+            pnl = self.day_pnl()
+            if pnl <= -lim:
+                self.halted = True   # before flatten: no re-opening
+                log.critical("DAILY LOSS BREAKER: day PnL $%.4f <= -%.2f — "
+                             "flattening and halting / 日亏损断路器触发",
+                             pnl, lim)
+                await self._flatten_all("daily loss breaker")
+
+    async def _flatten_all(self, reason: str) -> None:
+        """Reduce-only taker both venues toward flat, best effort, bounded
+        rounds. Residuals are left to reconcile (e.g. sub-minimum dust or an
+        outage venue) and surfaced loudly."""
+        log.warning("[FLATTEN] requested: %s", reason)
+        slip = 2.0 * self.cfg.hedge_slippage_bps / 1e4
+        for _round in range(6):
+            pending = [v for v in self.venues.values()
+                       if abs(v.position) > self.cfg.net_tolerance_base]
+            if not pending:
+                log.info("[FLATTEN] all venues flat")
+                return
+            for v in pending:
+                if v.key in self._venue_down:
+                    log.error("[FLATTEN] %s unreachable — residual %+.6g "
+                              "needs manual close", v.name, v.position)
+                    continue
+                lk = self._vlock(v.key)
+                if lk.locked():
+                    continue
+                is_buy = v.position < 0
+                qty = floor_step(abs(v.position), self._step)
+                ref = v.book.best_ask() if is_buy else v.book.best_bid()
+                if qty <= 0 or ref is None:
+                    continue
+                limit = v.px_round(ref * (1 + slip) if is_buy
+                                   else ref * (1 - slip), is_buy)
+                if qty * limit < self.cfg.min_order_notional:
+                    log.error("[FLATTEN] %s residual $%.2f under venue "
+                              "minimum — manual close needed", v.name,
+                              qty * limit)
+                    continue
+                await lk.acquire()
+                try:
+                    info = await v.send_taker(is_buy=is_buy, qty=qty,
+                                              limit_px=limit,
+                                              reduce_only=True)
+                    fill = info.get("filled_base") or 0.0
+                    px = info.get("avg_px") or limit
+                    if fill:
+                        fee = v.fee_bps / 1e4
+                        v.position += fill if is_buy else -fill
+                        v.cash += -fill * px * (1 + fee) if is_buy \
+                            else fill * px * (1 - fee)
+                        v.volume_usd += fill * px
+                        self.ledger.fill(v.key, is_buy=is_buy, qty=fill,
+                                         px=px, fee_bps=v.fee_bps)
+                    v.last_traded_ts = time.time()
+                    if info.get("err") or info.get("unresolved"):
+                        log.error("[FLATTEN] %s: %s", v.name,
+                                  info.get("err") or "unresolved")
+                        self._reconcile_evt.set()
+                    else:
+                        log.info("[FLATTEN] %s %s %.6g @ %.6g", v.name,
+                                 "BUY" if is_buy else "SELL", fill, px)
+                finally:
+                    lk.release()
+            await asyncio.sleep(0.5)
+        left = " ".join(f"{v.name} {v.position:+.6g}"
+                        for v in self.venues.values() if abs(v.position) > 0)
+        if left:
+            log.critical("[FLATTEN] INCOMPLETE — residual %s; reconcile will "
+                         "retry, check manually / 未完全平仓", left)
 
     def premium_bps(self) -> Optional[float]:
         em, hm = self.entropy.book.mid(), self.hedge.book.mid()
@@ -1005,6 +1332,7 @@ class Engine:
                 await asyncio.sleep(cfg.status_interval_sec)
             except asyncio.CancelledError:
                 raise
+            await self._risk_check()
             books = " | ".join(
                 f"{v.name} {v.book.best_bid() or '—'}/{v.book.best_ask() or '—'}"
                 + ("" if v.book.is_fresh(cfg.staleness_sec) else " STALE")
@@ -1033,11 +1361,17 @@ class Engine:
             rec = (f" | rec {self.recorder.rows_written} rows"
                    if self.recorder else "")
             mid, up, lo = self._band()
+            r_ = self.ledger.realized()
+            u_ = self.ledger.unrealized({v.key: (v.book.mid() or 0.0)
+                                         for v in self.venues.values()})
+            f_ = self.ledger.fees()
             log.info("[status] %s | prem %s bps%s (band %+.2f..%+.2f) | pos %s "
-                     "net %+.6g | trades %d hedges %d | MTM %s expEdge $%.4f "
+                     "net %+.6g | trades %d hedges %d | pnl R $%+.4f u $%+.4f "
+                     "day $%+.4f fees $%.4f | MTM %s expEdge $%.4f "
                      "fillEdge $%.4f%s%s",
                      books, prem_s, ex_disp, mid - lo, mid + up,
                      pos, net, self.trades, self.hedges,
+                     r_, u_, self.day_pnl(), f_,
                      f"${pnl:+.4f}" if pnl is not None else "—",
                      self.total_exp_edge, self.total_fill_edge, rec,
                      " *** HALTED ***" if self.halted else "")

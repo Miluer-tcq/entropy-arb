@@ -178,12 +178,27 @@ class Config:
     # below this many bps of the slice notional (0 = disabled). Stops the
     # stale-anchor / frozen-tuner case from opening negative-edge trades.
     min_net_edge_bps: float = 0.0
+    # --- risk / exit policy (all 0 = disabled, back-compat) ---------------
+    daily_max_loss_usd: float = 0.0   # realized+unrealized daily drawdown
+                                      # that trips flatten + halt
+    reversion_close_bps: float = 0.0  # close inventory once |premium-mid|
+                                      # inside this (exit decoupled from band)
+    timeout_close_min: float = 0.0    # close inventory held longer than this
+    min_cross_rounds: float = 0.0     # refuse opens when q_max < N minimum
+                                      # sized rounds (thin-book anti-churn)
     # stale-book sanity ceiling (0 = off): if the TOP executable premium is
     # above this many bps the "opportunity" is almost certainly one venue's
     # quote lagging a fast move — the profitable leg cancels and we hedge the
     # naked remainder. 09-01: every >=19bps signal cancelled one leg, zero
     # above 18bps ever filled both.
     max_top_premium_bps: float = 0.0
+    # maker ladder (opt-in): when the ceiling rejects a fat signal, instead
+    # of discarding it, rest the ENTROPY leg at the stale price it was quoted
+    # at and wait: real dislocation -> HL returns to us, we get paid to be
+    # right (maker), then take the hedge; a jump -> never filled, cancel,
+    # zero cost. Free option priced by the venue that is slow to move.
+    maker_enabled: bool = False
+    maker_wait_sec: float = 3.0
     session_upper_bps: Optional[float] = None
     session_lower_bps: Optional[float] = None
     session_midline_bps: Optional[float] = None
@@ -226,6 +241,8 @@ _SCHEMA: Dict[str, Any] = {
         "auto_frozen_fallback_min": float,
         "min_net_edge_bps": float,
         "max_top_premium_bps": float,
+        "maker_enabled": bool,
+        "maker_wait_sec": float,
         "windows": "list",
         "by_session": {
             "start_utc": str,
@@ -272,6 +289,10 @@ _SCHEMA: Dict[str, Any] = {
         "reconcile_sec": float,
         "venue_probe_sec": float,
         "http_keepalive_sec": float,
+        "daily_max_loss_usd": float,
+        "reversion_close_bps": float,
+        "timeout_close_min": float,
+        "min_cross_rounds": float,
     },
     "recorder": {
         "enabled": bool,
@@ -495,6 +516,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if mxp < 0:
         raise ConfigError("thresholds.max_top_premium_bps must be >= 0 "
                           "(0 disables the stale-book ceiling)")
+    mk_on = bool(thr.get("maker_enabled", False))
+    mk_wait = float(thr.get("maker_wait_sec", 3.0))
+    if mk_wait <= 0:
+        raise ConfigError("thresholds.maker_wait_sec must be > 0")
     fbf = float(thr.get("auto_frozen_fallback_min", 30.0))
     if fbf < 0:
         raise ConfigError("thresholds.auto_frozen_fallback_min must be >= 0 "
@@ -631,6 +656,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         auto_frozen_fallback_min=fbf,
         min_net_edge_bps=mne,
         max_top_premium_bps=mxp,
+        maker_enabled=mk_on,
+        maker_wait_sec=mk_wait,
         session_upper_bps=sess_upper,
         session_lower_bps=sess_lower,
         session_midline_bps=sess_midline,
@@ -655,6 +682,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         reconcile_sec=float(_get(raw, "execution", "reconcile_sec", 15.0)),
         venue_probe_sec=float(_get(raw, "execution", "venue_probe_sec", 30.0)),
         http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
+        daily_max_loss_usd=float(_get(raw, "execution", "daily_max_loss_usd", 0.0)),
+        reversion_close_bps=float(_get(raw, "execution", "reversion_close_bps", 0.0)),
+        timeout_close_min=float(_get(raw, "execution", "timeout_close_min", 0.0)),
+        min_cross_rounds=float(_get(raw, "execution", "min_cross_rounds", 0.0)),
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
         log_level=_validated_log_level(_get(raw, "logging", "level", "INFO")),

@@ -14,6 +14,7 @@ venue: {status, filled_base, avg_px, err, unresolved}.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -90,13 +91,75 @@ class HLVenue:
         self._cloid = int(time.time() * 1000)
         self._signing = None      # lazy hyperliquid-sdk signing module
         self._unified: Optional[bool] = None  # cached userAbstraction state
+        # /info budget hygiene (HL rate-limits per IP, and all recorder/engine
+        # processes on this box share one budget — a 429 today proved that):
+        # serialized pacing between calls, exponential penalty on 429, plus a
+        # short per-payload cache so one reconcile cycle's three near-identical
+        # clearinghouse reads cost one request.
+        self._info_lock: Optional[asyncio.Lock] = None
+        self._info_next = 0.0
+        self._info_penalty = 0.0
+        self._info_cache: dict = {}
+        self.info_min_interval = 0.25
+        # live Gtc maker orders (cloid) — cancel_resting() drains these on
+        # shutdown so no passive order can survive the process
+        self._resting: set = set()
 
-    async def _info(self, payload: dict):
-        async with self.session.post(
-                self.api_url + "/info", json=payload,
-                timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT)) as r:
-            r.raise_for_status()
-            return await r.json()
+    async def _info(self, payload: dict, ttl: float = 0.0):
+        """POST /info with pacing, 429 retry, and optional (sub-second-TTL)
+        result coalescing. ttl=0 must be used for anything a fresh answer
+        matters for (orderStatus polls, position reconcile)."""
+        if self._info_lock is None:
+            self._info_lock = asyncio.Lock()
+        key = json.dumps(payload, sort_keys=True) if ttl > 0 else None
+        if key:
+            hit = self._info_cache.get(key)
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+        err = None
+        for _attempt in range(2):
+            async with self._info_lock:
+                gap = self._info_next - time.monotonic()
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                self._info_next = (time.monotonic() + self.info_min_interval
+                                   + self._info_penalty)
+                wait = 0.0
+                try:
+                    async with self.session.post(
+                            self.api_url + "/info", json=payload,
+                            timeout=aiohttp.ClientTimeout(
+                                total=INFO_TIMEOUT)) as r:
+                        if r.status == 429:
+                            self._info_penalty = min(
+                                max(self._info_penalty, 0.5) * 2.0, 15.0)
+                            ra = r.headers.get("Retry-After")
+                            try:
+                                wait = min(float(ra), 5.0) if ra else 1.5
+                            except ValueError:
+                                wait = 1.5
+                            err = aiohttp.ClientResponseError(
+                                r.request_info, r.history, status=429,
+                                message="Too Many Requests")
+                        else:
+                            r.raise_for_status()
+                            data = await r.json()
+                            self._info_penalty *= 0.5
+                            if key and len(self._info_cache) < 64:
+                                self._info_cache[key] = (time.monotonic()
+                                                         + ttl, data)
+                            return data
+                except aiohttp.ClientResponseError as e:
+                    if e.status != 429:
+                        raise
+                    self._info_penalty = min(max(self._info_penalty, 0.5)
+                                             * 2.0, 15.0)
+                    wait, err = 1.5, e
+            if wait:
+                await asyncio.sleep(wait)
+        if err is not None:
+            raise err
+        raise RuntimeError("HL /info retry loop exited without result")
 
     async def load_market(self) -> None:
         dexs = await self._info({"type": "perpDexs"})
@@ -265,6 +328,143 @@ class HLVenue:
         return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
                 "err": None, "unresolved": True}
 
+    async def _order_state(self, cloid) -> Optional[dict]:
+        """(status, filled_base, avg_px) for one of our orders by cloid, or
+        None while the read fails / the order is unknown yet."""
+        try:
+            st = await self._info({"type": "orderStatus",
+                                   "user": self.account.query_address,
+                                   "oid": cloid.to_raw()})
+        except Exception:
+            return None
+        if not st or st.get("status") != "order":
+            return None
+        o = st.get("order") or {}
+        inner = o.get("order") or {}
+        try:
+            filled = max(float(inner.get("origSz") or 0.0)
+                         - float(inner.get("sz") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        tf = o.get("totalFilled")
+        if tf not in (None, ""):
+            try:
+                filled = max(filled, float(tf))
+            except (TypeError, ValueError):
+                pass
+        avg = None
+        try:
+            if filled > 0 and o.get("avgFillPrice"):
+                avg = float(o["avgFillPrice"])
+        except (TypeError, ValueError):
+            avg = None
+        return {"status": str(o.get("status", "")), "filled": filled,
+                "avg_px": avg}
+
+    async def _cancel_cloid(self, cloid) -> None:
+        s = self._signing
+        action = {"type": "cancelByCloid",
+                  "cancels": [{"asset": self.asset_id,
+                               "cloid": cloid.to_raw()}]}
+        try:
+            nonce = self.account.nonces.next()
+            sig = s.sign_l1_action(self.account.wallet, action, None, nonce,
+                                   None, self.account.is_mainnet)
+            await self._post_exchange(
+                {"action": action, "nonce": nonce, "signature": sig,
+                 "vaultAddress": None, "expiresAfter": None})
+        except Exception as e:
+            log.warning("[%s] cancelByCloid failed: %r", self.name, e)
+
+    async def send_maker(self, *, is_buy: bool, qty: float, limit_px: float,
+                         wait_sec: float, reduce_only: bool = False) -> dict:
+        """Post a Gtc resting order and watch it for up to wait_sec.
+
+        The maker ladder bet: if the displayed price was a genuine quote the
+        book returns to it and we get PAID to be right (fill without
+        crossing); if it was a jump into a moving market nobody ever trades
+        with us and the order is cancelled — zero cost. Returns the same
+        dict shape as send_taker (status 'filled' with quantity, or
+        'canceled'/'send-failed'). Guarantees no resting order survives the
+        call: it is cancelled before returning even on cancellation."""
+        assert self.account is not None and self.asset_id >= 0
+        s = self._signing
+        cloid = self._next_cloid()
+        order_req = {"coin": self.coin, "is_buy": is_buy,
+                     "sz": round(qty, 8), "limit_px": limit_px,
+                     "order_type": {"limit": {"tif": "Gtc"}},
+                     "reduce_only": reduce_only, "cloid": cloid}
+        try:
+            wire = s.order_request_to_order_wire(order_req, self.asset_id)
+            action = s.order_wires_to_order_action([wire])
+            nonce = self.account.nonces.next()
+            sig = s.sign_l1_action(self.account.wallet, action, None, nonce,
+                                   None, self.account.is_mainnet)
+            payload = {"action": action, "nonce": nonce, "signature": sig,
+                       "vaultAddress": None, "expiresAfter": None}
+        except Exception as e:
+            return {"status": "send-failed", "filled_base": 0.0,
+                    "avg_px": None, "err": f"signing failed: {e!r}",
+                    "unresolved": False}
+        self._resting.add(cloid)
+        try:
+            body, err, ambiguous = await self._post_exchange(payload)
+            res = None if (err or ambiguous or not body) else self._parse(body)
+            if res and res.get("err"):
+                return res
+            if res and res["status"] == "filled":
+                return res          # crossed on arrival: instant fill
+            if err or ambiguous or res is None:
+                # order may or may not be live: one state read decides
+                st = await self._order_state(cloid)
+                if st and st["status"] != "open":
+                    return await self._maker_terminal(st)
+                await self._cancel_cloid(cloid)
+                st = await self._order_state(cloid)
+                if st and st["filled"] > 0:
+                    return await self._maker_terminal(st)
+                return {"status": "canceled", "filled_base": 0.0,
+                        "avg_px": None, "err": err, "unresolved": False}
+            # resting: watch for a pull-back into our price
+            deadline = time.time() + max(wait_sec, 0.2)
+            while time.time() < deadline:
+                await asyncio.sleep(0.35)
+                st = await self._order_state(cloid)
+                if st and st["status"] and st["status"] != "open":
+                    return await self._maker_terminal(st)
+            # patience over: pull it (race-safe final read)
+            await self._cancel_cloid(cloid)
+            st = await self._order_state(cloid)
+            if st and st["filled"] > 0:
+                return await self._maker_terminal(st)
+            return {"status": "canceled", "filled_base": 0.0,
+                    "avg_px": None, "err": None, "unresolved": False}
+        except asyncio.CancelledError:
+            # shutdown mid-watch: the order is still live — the shield keeps
+            # the cancel request in flight even though we propagate
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._cancel_cloid(cloid))
+            raise
+        finally:
+            self._resting.discard(cloid)
+
+    async def _maker_terminal(self, st: dict) -> dict:
+        """A watch loop ended on a non-open order: HL reports 'filled' for a
+        completed resting order but the status string can also be a cancel
+        reason with a partial fill behind it — take the economics, not the
+        label."""
+        if st["filled"] > 0:
+            return {"status": "filled", "filled_base": st["filled"],
+                    "avg_px": st["avg_px"], "err": None, "unresolved": False}
+        return {"status": st["status"] or "canceled", "filled_base": 0.0,
+                "avg_px": None, "err": None, "unresolved": False}
+
+    async def cancel_resting(self) -> None:
+        """Shutdown safety: no maker order may survive the process."""
+        for cloid in list(self._resting):
+            await self._cancel_cloid(cloid)
+        self._resting.clear()
+
     async def _post_exchange(self, payload: dict):
         try:
             async with self.session.post(
@@ -340,7 +540,7 @@ class HLVenue:
             return None
         if self.include_core_equity:
             try:
-                p = await self._info({"type": "portfolio", "user": addr})
+                p = await self._info({"type": "portfolio", "user": addr}, ttl=2.0)
                 for period, d in p:
                     if period == "day":
                         hist = d.get("accountValueHistory") or []
@@ -356,7 +556,7 @@ class HLVenue:
         eq = fr = 0.0
         for dex in dexs:
             st = await self._info({"type": "clearinghouseState", "user": addr,
-                                   "dex": dex})
+                                   "dex": dex}, ttl=2.0)
             ms = st.get("marginSummary") or {}
             eq += float(ms.get("accountValue") or 0.0)
             fr += float(st.get("withdrawable") or 0.0)
@@ -379,7 +579,7 @@ class HLVenue:
     async def _spot_usdc_free(self, addr: str) -> float:
         try:
             st = await self._info({"type": "spotClearinghouseState",
-                                   "user": addr})
+                                   "user": addr}, ttl=2.0)
             return self.spot_usdc_free(st.get("balances") or [])
         except Exception as e:
             log.debug("[%s] spot balance fetch failed: %r", self.name, e)
@@ -392,7 +592,8 @@ class HLVenue:
         equity poll instead of freezing a wrong answer."""
         if self._unified is None:
             try:
-                r = await self._info({"type": "userAbstraction", "user": addr})
+                r = await self._info({"type": "userAbstraction", "user": addr},
+                            ttl=60.0)
             except Exception as e:
                 log.debug("[%s] abstraction lookup failed: %r", self.name, e)
                 return False
@@ -404,7 +605,7 @@ class HLVenue:
         free to use); None when the API call fails."""
         try:
             st = await self._info({"type": "clearinghouseState", "user": addr,
-                                   "dex": self.conf.hl_dex})
+                                   "dex": self.conf.hl_dex}, ttl=2.0)
             return float(st.get("withdrawable") or 0.0)
         except Exception as e:
             log.debug("[%s] withdrawable fetch failed: %r", self.name, e)
@@ -418,7 +619,7 @@ class HLVenue:
         if addr is None:
             return None
         try:
-            r = await self._info({"type": "userFees", "user": addr})
+            r = await self._info({"type": "userFees", "user": addr}, ttl=300.0)
             rate = r.get("userCrossRate")
             if rate is None:
                 return None
@@ -433,7 +634,8 @@ class HLVenue:
         the dex's metaAndAssetCtxs. None when unavailable."""
         try:
             meta, ctxs = await self._info(
-                {"type": "metaAndAssetCtxs", "dex": self.conf.hl_dex})
+                {"type": "metaAndAssetCtxs", "dex": self.conf.hl_dex},
+                ttl=60.0)
             names = [a["name"] for a in meta.get("universe") or []]
             if self.coin not in names:
                 return None
@@ -448,7 +650,7 @@ class HLVenue:
         addr = self._query_address()
         assert addr is not None
         st = await self._info({"type": "clearinghouseState", "user": addr,
-                               "dex": self.conf.hl_dex})
+                               "dex": self.conf.hl_dex}, ttl=2.0)
         for ap in st.get("assetPositions") or []:
             pos = ap.get("position") or {}
             if pos.get("coin") == self.coin:

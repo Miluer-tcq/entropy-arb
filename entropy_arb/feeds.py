@@ -30,6 +30,33 @@ from .book import OrderBook
 
 log = logging.getLogger("feeds")
 
+# a book with no frames at all for this long is a dead-but-open socket
+SILENCE_RECONNECT_SEC = 30.0
+
+
+async def _silence_watchdog(name: str, ws, book, connected_at: float,
+                            silence_sec: float = SILENCE_RECONNECT_SEC,
+                            check_sec: float = 5.0) -> None:
+    """Silence reaper shared by both feeds: a socket can stay TCP-healthy
+    while its stream dies (upstream wedge after a laptop wake, silent drop
+    that protocol pings keep answering). If the book has seen no frame of
+    any kind for SILENCE_RECONNECT_SEC, cut the line so run() resubscribes
+    fresh (the resubscribe's snapshot re-primes everything)."""
+    try:
+        while True:
+            await asyncio.sleep(check_sec)
+            last = max(getattr(book, "last_update_ts", 0.0), connected_at)
+            if time.time() - last > silence_sec:
+                log.warning("[%s] feed silent %.0fs — forcing reconnect",
+                            name, time.time() - last)
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+
 
 def _chan_id(channel: str) -> Optional[int]:
     """'order_book:32' / 'order_book/32' -> 32."""
@@ -103,24 +130,31 @@ class LighterBookFeed:
                     self.book.clear()
                     self._nonce = None
                     self._synced = False
-                    async for raw in ws:
-                        # only a long-lived connection resets the backoff —
-                        # a flapping link must not reconnect-storm
-                        if time.time() - connected_at > 60.0:
-                            backoff = 1.0
-                        msg = json.loads(raw)
-                        t = msg.get("type")
-                        self.book.touch()
-                        if t == "update/order_book":
-                            await self._handle_book(ws, msg, snapshot=False)
-                        elif t == "subscribed/order_book":
-                            await self._handle_book(ws, msg, snapshot=True)
-                        elif t == "connected":
-                            await self._subscribe(ws)
-                        elif t == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-                        if stop.is_set():
-                            break
+                    wd = asyncio.create_task(_silence_watchdog(self.name, ws, self.book,
+                                                 connected_at))
+                    try:
+                        async for raw in ws:
+                            # only a long-lived connection resets the backoff
+                            # — a flapping link must not reconnect-storm
+                            if time.time() - connected_at > 60.0:
+                                backoff = 1.0
+                            msg = json.loads(raw)
+                            t = msg.get("type")
+                            self.book.touch()
+                            if t == "update/order_book":
+                                await self._handle_book(ws, msg, snapshot=False)
+                            elif t == "subscribed/order_book":
+                                await self._handle_book(ws, msg, snapshot=True)
+                            elif t == "connected":
+                                await self._subscribe(ws)
+                            elif t == "ping":
+                                await ws.send(json.dumps({"type": "pong"}))
+                            if stop.is_set():
+                                break
+                    finally:
+                        wd.cancel()
+                        with contextlib.suppress(BaseException):
+                            await wd
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -189,14 +223,21 @@ class HLBookFeed:
                         "subscription": {"type": "l2Book", "coin": self.coin,
                                          "fast": True}}))
                     ptask = asyncio.create_task(self._pinger(ws))
-                    async for raw in ws:
-                        # only a long-lived connection resets the backoff —
-                        # a flapping link must not reconnect-storm
-                        if time.time() - connected_at > 60.0:
-                            backoff = 1.0
-                        self._on_frame(json.loads(raw))
-                        if stop.is_set():
-                            break
+                    wd = asyncio.create_task(_silence_watchdog(self.name, ws, self.book,
+                                                 connected_at))
+                    try:
+                        async for raw in ws:
+                            # only a long-lived connection resets the backoff
+                            # — a flapping link must not reconnect-storm
+                            if time.time() - connected_at > 60.0:
+                                backoff = 1.0
+                            self._on_frame(json.loads(raw))
+                            if stop.is_set():
+                                break
+                    finally:
+                        wd.cancel()
+                        with contextlib.suppress(BaseException):
+                            await wd
             except asyncio.CancelledError:
                 raise
             except Exception as e:

@@ -24,6 +24,8 @@ def make_cfg(midline=5.0, upper=4.0, lower=3.0, min_net_edge=None,
     ceil_line = (f"  max_top_premium_bps: {max_top}\n"
                  if max_top is not None else "")
     f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    csv_path = (tempfile.mkdtemp(prefix="eab-rtest-") + "/trades.csv").replace(
+        "\\", "/")
     f.write(f"""
 thresholds:
   midline_bps: {midline}
@@ -31,6 +33,8 @@ thresholds:
   lower_bps: {lower}
 {floor_line}{ceil_line}execution:
   premium_persist_sec: 0.0
+logging:
+  trades_csv: "{csv_path}"
 """)
     f.close()
     return load_config(f.name, NO_ENV,
@@ -43,12 +47,37 @@ class StubVenue:
         self.cap_usd, self.fee_bps = cap, fee
         self.size_decimals, self.min_base, self.min_quote = 4, 1e-4, 10.0
         self.position, self.cash = 0.0, 0.0
+        self.volume_usd = 0.0
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
+        self.sent = []
+        self.chain_pos = None
+        self.maker_sent = []
+        self.maker_result = None
 
     def ready_to_trade(self):
         return True
+
+    def px_round(self, px, round_up=False):
+        return round(px, 2)
+
+    async def send_maker(self, *, is_buy, qty, limit_px, wait_sec,
+                         reduce_only=False):
+        # scripted by tests via .maker_result; default: never pulled back
+        self.maker_sent.append({"is_buy": is_buy, "qty": qty,
+                                "limit_px": limit_px, "wait_sec": wait_sec})
+        return dict(self.maker_result or {"status": "canceled",
+                                          "filled_base": 0.0,
+                                          "avg_px": None})
+
+    async def send_taker(self, *, is_buy, qty, limit_px, reduce_only=False):
+        self.sent.append({"is_buy": is_buy, "qty": qty, "limit_px": limit_px,
+                          "reduce_only": reduce_only})
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px}
+
+    async def fetch_position(self):
+        return self.position if self.chain_pos is None else self.chain_pos
 
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
@@ -175,6 +204,140 @@ def test_max_top_premium_ceiling_blocks_stale_book_trap():
     assert any("stale-book trap" in m for m in msgs), msgs
     eng.entropy.set_book(100.14, 100.16)   # 13bps: under the ceiling
     assert run_scan(eng) is not None
+
+
+def test_timeout_close_fires_inside_band():
+    # 09-01 lesson: a drifted anchor moved the sell-band out of reach and a
+    # +0.0193 long sat all day. Holding past the timeout forces the closing
+    # side even when the premium sits INSIDE the normal band.
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.timeout_close_min = 1.0
+    eng.entropy.position = 0.15            # long: sell_entropy closes it
+    eng._open_since = time.time() - 120.0
+    eng.entropy.set_book(100.04, 100.06)   # +5bps = mid: normally no fire
+    eng.hedge.set_book(99.99, 100.01)
+    best = run_scan(eng)
+    assert best is not None and best[1].key == "entropy"
+
+
+def test_reversion_close_fires_at_mid():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.reversion_close_bps = 1.5
+    eng.entropy.position = 0.15
+    eng._open_since = time.time() - 5.0    # timeout not hit
+    eng.entropy.set_book(100.04, 100.06)   # premium ~ +5 = midline
+    eng.hedge.set_book(99.99, 100.01)
+    best = run_scan(eng)
+    assert best is not None and best[1].key == "entropy"
+    # fresh inventory far from mid: neither exit trigger, no fire
+    eng2 = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng2.cfg.reversion_close_bps = 1.5
+    eng2.cfg.timeout_close_min = 999.0
+    eng2.entropy.position = 0.15
+    eng2._open_since = time.time()
+    eng2.entropy.set_book(100.08, 100.10)  # +8bps: inside band, >1.5 from mid
+    eng2.hedge.set_book(99.99, 100.01)
+    assert run_scan(eng2) is None
+
+
+def test_min_cross_rounds_blocks_thin_book_opens():
+    # 0.10 base crossable ~= $10 = one minimum round: dust-tail churn bait
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.min_cross_rounds = 2.0
+    eng.entropy.set_book(100.14, 100.16, sz=0.10)
+    eng.hedge.set_book(99.99, 100.01, sz=0.10)
+    msgs = []
+    eng._skiplog = lambda fmt, *a: msgs.append(fmt % a)
+    assert run_scan(eng) is None
+    assert any("book too thin" in m for m in msgs), msgs
+    # the same thin book must still allow closing an existing long
+    eng.entropy.position = 0.05
+    assert run_scan(eng) is not None
+
+
+def test_daily_breaker_flattens_and_halts():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.daily_max_loss_usd = 0.10
+    eng.entropy.position = 0.15
+    eng.hedge.position = -0.15
+    eng.entropy.set_book(99.99, 100.01)
+    eng.hedge.set_book(99.99, 100.01)
+    eng.ledger.fill("entropy", is_buy=True, qty=0.15, px=100.0, fee_bps=0.0)
+    eng.ledger._get("entropy")["realized"] = -0.30   # simulate today's damage
+    asyncio.run(eng._risk_check())
+    assert eng.halted
+    assert abs(eng.entropy.position) < 1e-9 and abs(eng.hedge.position) < 1e-9
+    assert all(o["reduce_only"] for o in eng.entropy.sent + eng.hedge.sent)
+    # halted engine: breaker must not re-fire or re-flatten
+    n_sent = len(eng.entropy.sent)
+    asyncio.run(eng._risk_check())
+    assert len(eng.entropy.sent) == n_sent
+
+
+def test_maker_queued_when_ceiling_trips():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, max_top=18.0)
+    eng.cfg.maker_enabled = True
+    eng.entropy.set_book(100.40, 100.42)     # 39bps: over the ceiling
+    eng.hedge.set_book(99.99, 100.01)
+    assert run_scan(eng) is None
+    req = eng._maker_request
+    assert req is not None and req[0] == "sell_entropy"
+    assert eng.entropy.maker_sent == []      # queued, not fired yet
+
+
+def test_maker_fill_then_takes_hedge_leg():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, max_top=18.0)
+    eng.cfg.maker_enabled = True
+    eng.cfg.leg_slippage_bps = 0.0
+    eng.entropy.set_book(100.40, 100.42)
+    eng.hedge.set_book(99.99, 100.01)
+    run_scan(eng)
+    dkey, plan, buy, sell = eng._maker_request
+    eng._maker_request = None
+    q = plan.qty
+    eng.entropy.maker_result = {"status": "filled", "filled_base": q,
+                                "avg_px": 100.40}
+    eng.hedge.set_book(100.44, 100.46)       # hedge book at time of follow
+    asyncio.run(eng._run_maker(dkey, plan, buy, sell))
+    m = eng.entropy.maker_sent[0]
+    assert m["is_buy"] is False              # sold entropy into the pullback
+    assert eng.hedge.sent and eng.hedge.sent[0]["is_buy"] is True
+    approx(eng.entropy.position, -q)         # SELL maker -> short entropy
+    approx(eng.hedge.position, q)            # chased with a hedge BUY
+    assert abs(sum(v.position for v in eng.venues.values())) < 1e-9
+    assert eng.trades == 1
+
+
+def test_maker_cancel_costs_nothing():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0, max_top=18.0)
+    eng.cfg.maker_enabled = True
+    eng.entropy.set_book(100.40, 100.42)
+    eng.hedge.set_book(99.99, 100.01)
+    run_scan(eng)
+    dkey, plan, buy, sell = eng._maker_request
+    eng._maker_request = None
+    # default scripted maker_result = canceled (never pulled back)
+    asyncio.run(eng._run_maker(dkey, plan, buy, sell))
+    assert eng.entropy.maker_sent            # the rest was placed...
+    assert eng.hedge.sent == []              # ...but nothing chased
+    assert eng.entropy.position == 0.0 and eng.hedge.position == 0.0
+    assert eng.trades == 0
+
+
+def test_reconcile_reanchors_unknown_basis():
+    # external position (manual trade / missed settle) adopted from chain:
+    # the ledger must price it at mark, not book a phantom loss vs zero
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.entropy.set_book(99.99, 100.01)            # mid 100.0
+    eng.entropy.chain_pos = 0.10
+    asyncio.run(eng._reconcile_venue(eng.entropy, False))
+    s = eng.ledger.v["entropy"]
+    approx(s["pos"], 0.10)
+    approx(s["avg"], 100.0)
+    approx(eng.day_pnl(), 0.0, tol=1e-9)
+    # and the carried long closes with real economics, not -1000 phantom
+    eng.ledger.fill("entropy", is_buy=False, qty=0.10, px=101.0, fee_bps=0.0)
+    approx(eng.day_pnl(), 0.10, tol=1e-9)
 
 
 def test_scan_dust_edge_is_logged_not_silent():
