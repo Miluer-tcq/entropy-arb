@@ -25,13 +25,32 @@
   中枢下移），周末自动回退全局带。
 - **手续费/资金费率自动发现** —— 运行时从交易所拉取实际费率（配置值仅作兜底），TUI 可见。
 - **TUI 仪表盘** —— 任意终端高度精确铺满无空白、超长日志换行不截断、会话栏实时显示
-  交易时段与 1 小时中枢偏移（`--cn` 切换中文）。
-- **数据工具链** —— 分钟级采集器、分时段分析器（`tools/analyze.py`）、带宽回测器、
-  漂移监控模块，48 个 pytest 用例全覆盖。
+  交易时段与 1 小时中枢偏移，状态行含账本 `pnl 已实现/浮动/当日/手续费`（`--cn` 切换中文）。
+- **数据驱动阈值** —— `auto_midline` / `auto_band` 每分钟用稳定窗口的分位数重新
+  锚定中枢与带宽；中枢缓慢漂移时冻结调参、武装**漂移锁**（禁止逆着漂移方向开新仓，
+  平仓不受限），冻结持续超过 `auto_frozen_fallback_min` 分钟后改从最近 60 分钟
+  重锚，而不是抱着过时种子继续交易。
+- **执行安全闸门** —— `min_net_edge_bps` 净期望地板（费前预期低于地板不开仓，
+  平仓永不拦截）、`max_top_premium_bps` 幻象天花板（大到只成交一条腿的"价差"是
+  旧盘口不是机会）、`min_cross_rounds` 薄簿闸门（深度穿不过 N 个最小单不开仓）。
+- **Maker 阶梯**（`maker_enabled`）—— 被天花板拦下的肥价差改为在滞后那一边以
+  **被动挂单**等待回踩：真错位会以 maker 价成交并立刻补对冲腿；快速行情则永不成交、
+  超时撤单零成本。第二腿在第一条腿成交前绝不触碰——无裸腿窗口。
+- **风控与出场** —— 按均价法的已实现/未实现盈亏账本（手续费与对冲出血在付出的
+  瞬间入账）、UTC 日亏损断路器（`daily_max_loss_usd`，触发即双边 reduce-only
+  强平并停机）、与入场带解耦的出场（`reversion_close_bps` / `timeout_close_min`：
+  溢价回中枢或持仓超时即按"仅费"门槛强制放行平仓，锚点漂移永不搁浅库存）。
+- **韧性** —— Hyperliquid `/info` 串行限速+429 罚时+同请求合并缓存、行情喂线
+  静默看门狗（30 秒无帧强制重连）、共享 nonce 分配器、交易所故障暂停/探测、
+  对账绝不覆盖新鲜成交、Lighter 结算先等账户流就绪再发单（杜绝假"未确认"重发）。
+- **数据工具链** —— 分钟级采集器、分时段分析器（`tools/analyze.py`）、带宽回测器
+  （`tools/backtest.py`，可镜像实盘闸门回放）、资金费/基差判定（`tools/funding_check.py`）、
+  漂移监控模块，119 个 pytest 用例全覆盖。
 - **Windows 启动器** —— `run-live.ps1`：预检通过才启动 + 崩溃自动重启，退出码干净传递。
 
 当同一品种在一边贵、另一边便宜时，机器人同时在贵的一边卖出、便宜的一边买入
-（均为吃单），持有 delta 中性仓位，等溢价回归后反向平仓。所有交易决策使用的
+（默认双边吃单；开启 maker 阶梯后，过肥的价差改为被动挂单等回踩），持有
+delta 中性仓位，等溢价回归后反向平仓。所有交易决策使用的
 价格都来自**将要实际成交的那个交易所的真实订单簿**——Hyperliquid 的盘口来自
 官方 websocket（`wss://api.hyperliquid.xyz/ws`），Lighter 的盘口来自 Lighter
 官方 websocket。
@@ -165,9 +184,25 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `sizing.max_order_notional_usd` | 单笔名义上限 | 500 |
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
 | `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
+| `execution.daily_max_loss_usd` | UTC 日亏损（已实现+浮动）达到即双边强平并停机（0 = 关闭） | 0 |
+| `execution.reversion_close_bps` / `timeout_close_min` | 解耦出场：溢价回到中枢 ±bps 内、或持仓超过 N 分钟，即强制放行平仓 | 0 / 0 |
+| `execution.min_cross_rounds` | 可穿深度不足 N 个交易所最小单时拒绝开仓（平仓豁免） | 0 |
 | `execution.*` | 滑点保护、超时、对账周期等 | 见配置文件 |
 | `recorder.*` | 分钟数据采集器 | 开启，`logs/minutes.csv` |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
+
+数据驱动阈值与安全闸门键（均在 `thresholds:` 下，默认全部关闭/保守）：
+
+| 键 | 含义 | 默认值 |
+|---|---|---|
+| `auto_midline` | 每分钟用稳定窗口中位数重锚 `midline_bps` | false |
+| `auto_midline_clamp_bps` | 距手动锚点的最大偏移（手动值仍是先验） | 3.0 |
+| `auto_band` / `auto_band_trigger_pct` | 自动设带宽，使每侧大约在该 % 的分钟数上触发 | false / 10.0 |
+| `auto_band_floor_bps` / `auto_band_ceiling_bps` | 带宽上下限 | 2.0 / 8.0 |
+| `auto_frozen_fallback_min` | 漂移冻结超过该分钟后，改从最近 60 分钟重锚 | 30 |
+| `min_net_edge_bps` | 开仓的费后净期望硬地板（平仓不受限） | 0 |
+| `max_top_premium_bps` | 幻象天花板：超过此宽度的"价差"是旧盘口，不是机会 | 0 |
+| `maker_enabled` / `maker_wait_sec` | 天花板拦截改为在滞后所被动挂单等待，成交才补对冲腿 | false / 3.0 |
 
 ## 密钥配置（`.env`，仅实盘需要）
 
@@ -184,18 +219,28 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 
 ## 执行机制
 
-- 两条腿**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
+- 两条腿默认**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
   上异步确认成交；Hyperliquid 用 IOC 限价单同步结算（结果未知时轮询
   orderStatus 兜底）。
+- **安全闸门**（信号到下单之间）：`min_net_edge_bps` 净期望地板（只挡开仓、
+  平仓永远放行）、`max_top_premium_bps` 幻象天花板、`min_cross_rounds` 薄簿闸门。
+- **Maker 阶梯**（`maker_enabled`）：被天花板拦下的肥价差不再丢弃，而是改在
+  滞后的那一边以**被动挂单**挂在过时报价上等回踩——真错位会以 maker 价成交并
+  立即补对冲腿；快速行情则永远不成交、超时撤单零成本。第二腿在第一条腿成交
+  前绝不触碰——无裸腿窗口。
 - **持续性闸门**（`premium_persist_sec`）：信号先"武装"，持续存在才触发，
   过滤单 tick 的假信号。
 - **库存阶梯**：仓位超过上限的 `floor_frac` 后，同方向加仓需要线性递增的
   额外溢价，满仓时最高加 `scale_bps`。
+- **解耦出场**（`reversion_close_bps` / `timeout_close_min`）：平仓不再等入场
+  带——溢价回到中枢、或持仓超时，就以"仅费"门槛强制放行平仓，锚点漂移绝不会
+  把库存搁浅在场上。
 - **净敞口对冲**：两腿成交不对等时立即用 reduce-only 单（带滑点保护）
   削减敞口，并每 `reconcile_sec` 与链上仓位对账。
 - **故障隔离**：被限频的交易所短暂暂停；交易所不可达（如例行维护）时暂停
   交易并每 `venue_probe_sec` 探测直至恢复；连续 `max_consecutive_errors`
-  次执行异常则整体停机。
+  次执行异常则整体停机；`daily_max_loss_usd` 触发 UTC 日亏损断路器——
+  双边 reduce-only 强平后停机。
 - **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
   其余都是真金白银。
 
@@ -205,24 +250,32 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 main.py                  入口（--record-only，默认即实盘）
 entropy_arb/config.py    YAML + .env 配置契约与校验
 entropy_arb/book.py      订单簿 + 含手续费的套利规模计算
-entropy_arb/feeds.py     官方 HL ws + zkLighter ws 行情
-entropy_arb/venue_hl.py  Hyperliquid dex 适配器（Entropy、tradexyz）
+entropy_arb/feeds.py     官方 HL ws + zkLighter ws 行情（含静默看门狗）
+entropy_arb/venue_hl.py  Hyperliquid dex 适配器（Entropy、tradexyz）+ maker 挂单
 entropy_arb/venue_lighter.py  zkLighter 适配器（主网、Robinhood 链）
-entropy_arb/engine.py    双交易所策略主循环
+entropy_arb/engine.py    双交易所策略主循环、闸门、maker 阶梯、风控
+entropy_arb/ledger.py    按均价法的双所盈亏账本（已实现 + 手续费）
+entropy_arb/monitor.py   稳定窗口、漂移报告、自动中枢/带宽目标
+entropy_arb/preflight.py --preflight 启动预检
 entropy_arb/dashboard.py Rich 终端仪表盘
 entropy_arb/recorder.py  分钟级盘口数据采集
 tools/analyze.py         minutes.csv -> 阈值建议
+tools/backtest.py        带宽回放（可镜像实盘闸门）
+tools/funding_check.py   判定溢价是资金费 carry 还是结构性基差
+tools/session_stats.py   分时段溢价统计
 tests/                   python3 -m pytest tests/
 ```
 
 ## 已知风险
 
 - **中枢填错就是亏钱策略。** 溢价中枢会漂移，请定期重新测量并保持
-  `config.yaml` 与市场同步。
+  `config.yaml` 与市场同步（或开启 `auto_midline`/`auto_band` 并留意漂移锁日志）。
 - **USDG 基差**（`lighter-rh`）：对冲腿以 USDG 计价，持续溢价中有
   一部分是稳定币本身的基差；midline 吸收其水平，但 USDG 的*变动*是真实盈亏。
 - **资金费**：两个交易所、两套独立的资金费率，持仓成本未建模——仓位上限
-  请设小一些。
+  请设小一些。（在 entropy-io:SNDK vs Lighter 上的实测：资金费仅贡献约
+  0.6 bps/天，而基差在 −4 bps 量级——这是流动性基差，不是 carry。换市场
+  前请先跑 `tools/funding_check.py` 再下结论。）
 - **薄盘口**：Entropy 深度可能很小；`take_fraction` 与名义上限控制单笔规模，
   但部分成交后对冲腿的滑点是真实存在的。
 - **交易时段**：股票类永续（如 SNDK）盘后各所预言机行为不同，建议加宽带宽

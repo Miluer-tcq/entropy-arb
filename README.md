@@ -57,12 +57,13 @@ Open-source two-venue perp arbitrage bot. One leg is always **Entropy**
   with clean exit-code handling.
 
 When the same symbol trades rich on one venue and cheap on the other, the bot
-simultaneously sells the rich book and buys the cheap book with taker orders,
-carrying a delta-neutral position until the premium reverts and the opposite
-crossing unwinds it. Every price it acts on is the **actual order book of the
-exchange that will fill the order** — Hyperliquid books come from the official
-websocket (`wss://api.hyperliquid.xyz/ws`), Lighter books from Lighter's
-official websocket.
+simultaneously sells the rich book and buys the cheap book — by default with
+taker orders, or with a passive rest when the gap is too wide to be real on a
+cross — carrying a delta-neutral position until the premium reverts and the
+opposite crossing unwinds it. Every price it acts on is the **actual order
+book of the exchange that will fill the order** — Hyperliquid books come from
+the official websocket (`wss://api.hyperliquid.xyz/ws`), Lighter books from
+Lighter's official websocket.
 
 While it runs — even with no credentials and no strategy — it records both
 books to **1-minute CSV bars**, and the bundled analyzer turns that data into
@@ -204,9 +205,25 @@ errors), credentials in `.env`, and the markets on the command line
 | `sizing.max_order_notional_usd` | per-slice cap | 500 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
+| `execution.daily_max_loss_usd` | UTC-day realized+unrealized loss that flattens both legs and halts (0 = off) | 0 |
+| `execution.reversion_close_bps` / `timeout_close_min` | band-decoupled exits: force-close inventory once premium is within `|premium − midline| ≤ bps`, or after N minutes held | 0 / 0 |
+| `execution.min_cross_rounds` | refuse opens unless book depth crosses ≥ N venue minimums (closes exempt) | 0 |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
 | `recorder.*` | minute-data recorder | on, `logs/minutes.csv` |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
+
+Data-driven threshold keys (all inside `thresholds:`, all opt-in):
+
+| key | meaning | default |
+|---|---|---|
+| `auto_midline` | re-anchor `midline_bps` from the stable-window median each minute | false |
+| `auto_midline_clamp_bps` | max distance from the manual anchor (the manual value stays the prior) | 3.0 |
+| `auto_band` / `auto_band_trigger_pct` | size `upper/lower` so each side fires on ~this % of minutes | false / 10.0 |
+| `auto_band_floor_bps` / `auto_band_ceiling_bps` | band size limits | 2.0 / 8.0 |
+| `auto_frozen_fallback_min` | after the drift-freeze lasts this long, re-anchor from the last 60 min instead of trading a stale seed | 30 |
+| `min_net_edge_bps` | hard floor on post-fee expected edge for **opens** (closes exempt) | 0 |
+| `max_top_premium_bps` | sanity ceiling: "spreads" this wide are stale books, not opportunity | 0 |
+| `maker_enabled` / `maker_wait_sec` | ceiling rejects rest a passive order on the lagging venue; hedge only if it prints | false / 3.0 |
 
 ## Credentials (`.env`, live only)
 
@@ -223,21 +240,37 @@ errors), credentials in `.env`, and the markets on the command line
 
 ## How execution works
 
-- Both legs are **taker** orders sent concurrently: Lighter market orders
-  with average-price protection settling on the authenticated account
+- Both legs are normally **taker** orders sent concurrently: Lighter market
+  orders with average-price protection settling on the authenticated account
   websocket; Hyperliquid IOC limits settling synchronously (with
   orderStatus polling for unknown outcomes).
+- **Safety gates** between signal and send: a `min_net_edge_bps` floor (no
+  open below post-fee expected edge — closes always exempt), a
+  `max_top_premium_bps` ceiling (a gap too wide to survive the trip to the
+  exchange is a stale book, not an opportunity), and `min_cross_rounds`
+  (book too thin to hedge cleanly).
+- **Maker ladder** (`maker_enabled`): instead of discarding a ceiling
+  reject, the bot rests a **passive** order on the lagging venue at its
+  stale price and only takes the hedge once that order prints. A real
+  mispricing pays with maker economics; a fast move simply never fills it
+  and it is cancelled at zero cost — and because the second leg is never
+  touched before the first prints, there is no naked-leg window.
 - A **persistence gate** (`premium_persist_sec`) arms each direction and only
   fires if the edge survives — one-tick phantoms are filtered.
 - **Inventory ladder**: past `floor_frac` of a venue's cap, adding to the
   position requires linearly more edge, up to `scale_bps` extra at the cap.
+- **Decoupled exits**: with `reversion_close_bps` / `timeout_close_min`,
+  closing inventory does not wait for the entry band — once the premium is
+  back at the midline or a hold times out, the unwind fires at a fee-only
+  hurdle, so a drifted anchor can never strand a position.
 - **Net-delta hedge**: if legs fill unevenly, the imbalance is immediately
   reduced (reduce-only, price-protected), and positions are reconciled
   against the chain every `reconcile_sec`.
 - **Failure containment**: a rate-limited venue pauses briefly; an
   unreachable venue (e.g. exchange maintenance) pauses trading and is probed
   every `venue_probe_sec` until it recovers; `max_consecutive_errors`
-  execution pathologies halt the engine entirely.
+  execution pathologies halt the engine entirely; `daily_max_loss_usd`
+  flattens both legs and halts on a bad UTC day.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 
@@ -247,25 +280,35 @@ errors), credentials in `.env`, and the markets on the command line
 main.py                  entry point (--record-only, or live by default)
 entropy_arb/config.py    YAML + .env contract, validation
 entropy_arb/book.py      order books + fee-aware crossing/sizing math
-entropy_arb/feeds.py     official HL ws + zkLighter ws book feeds
-entropy_arb/venue_hl.py  Hyperliquid dex adapter (Entropy, tradexyz)
+entropy_arb/feeds.py     official HL ws + zkLighter ws book feeds (+ silence watchdog)
+entropy_arb/venue_hl.py  Hyperliquid dex adapter (Entropy, tradexyz) + maker/resting orders
 entropy_arb/venue_lighter.py  zkLighter adapter (mainnet, Robinhood chain)
-entropy_arb/engine.py    the two-venue strategy loop
+entropy_arb/engine.py    the two-venue strategy loop, gates, maker ladder, risk checks
+entropy_arb/ledger.py    per-venue avg-cost PnL ledger (realized + fees)
+entropy_arb/monitor.py   stable-window, drift report, auto midline/band targets
+entropy_arb/preflight.py --preflight go/no-go checks
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute orderbook bars
 tools/analyze.py         minutes.csv -> suggested thresholds
+tools/backtest.py        band replay with live-mirroring gate simulation
+tools/funding_check.py   is the premium funding carry or structural basis?
+tools/session_stats.py   per-session premium stats from the recorder CSV
 tests/                   python3 -m pytest tests/
 ```
 
 ## Known risks
 
 - **A wrong midline is a losing strategy.** The premium center drifts;
-  re-measure regularly and keep `config.yaml` current.
+  re-measure regularly and keep `config.yaml` current (or run
+  `auto_midline`/`auto_band` and read the drift-lock logs).
 - **USDG basis** (`lighter-rh`): the hedge quotes in USDG. Part of any
   persistent premium is the stablecoin itself; your midline absorbs the
   level, but a USDG *move* is real PnL.
 - **Funding**: two venues, two independent funding rates; carry is not
-  modeled. Position caps bound it — keep them modest.
+  modeled. Position caps bound it — keep them modest. (Measured on
+  entropy-io:SNDK vs Lighter, funding contributes ~0.6 bps/day while the
+  basis sits at −4 bps: this is a liquidity basis, not carry — run
+  `tools/funding_check.py` before assuming otherwise on another market.)
 - **Thin books**: Entropy depth can be tiny; `take_fraction` and notional
   caps keep clips small, but slippage on the hedge leg after a partial fill
   is real.

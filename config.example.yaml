@@ -49,6 +49,44 @@ thresholds:
   # WATCH 面板都会显示漂移值。
   # auto_midline: true
   #
+  # auto_band (opt-in, default false): size upper/lower from the stable-window
+  # distribution so each side fires on roughly auto_band_trigger_pct of
+  # minutes (clamped to [floor, ceiling] bps). Pairs with auto_midline.
+  # auto_band（可选，默认关）：按稳定窗口分位数自动设带宽，使每侧大约在
+  # trigger_pct 的分钟数上触发（限制在 floor..ceiling 之间）。与 auto_midline 搭配。
+  # auto_band: true
+  # auto_band_trigger_pct: 10.0
+  # auto_band_floor_bps: 2.0
+  # auto_band_ceiling_bps: 8.0
+  #
+  # auto_frozen_fallback_min: when the tuner's drift-lock stays frozen this
+  # many minutes, re-anchor from the LAST 60 minutes instead of trading the
+  # stale seed (0 = never fall back). The lock blocks opens against travel;
+  # closes are always exempt.
+  # 漂移冻结超过该分钟后，改从最近 60 分钟重锚，避免抱着过时种子交易（0=关闭）。
+  # auto_frozen_fallback_min: 30
+  #
+  # Execution gates between signal and send. The floor is a hard net-expected
+  # edge (after fees, before slippage) an OPEN must clear — closes are never
+  # blocked. The ceiling is a sanity bound on the raw top-of-book premium:
+  # a gap wider than this cannot survive the trip to the exchange; it is a
+  # stale book, not an opportunity.
+  # 开仓前的费后净期望硬地板（平仓永不拦截）与幻象天花板：超过天花板的
+  # "价差"是旧盘口，不是机会。
+  # min_net_edge_bps: 2.5
+  # max_top_premium_bps: 18
+  #
+  # maker_enabled: instead of discarding a ceiling reject, rest a PASSIVE
+  # order on the lagging venue at its stale price and only take the hedge
+  # once that order prints (or cancel after maker_wait_sec at zero cost).
+  # Real mispricings fill with maker economics; fast moves simply never
+  # fill. The second leg is never touched before the first prints — no
+  # naked-leg window.
+  # maker_enabled（可选）：被天花板拦截的肥价差改为在滞后所被动挂单等回踩，
+  # 成交才补对冲腿；超时撤单零成本。第一腿成交前绝不触碰第二腿。
+  # maker_enabled: false
+  # maker_wait_sec: 3.0
+  #
   # by_session (optional): use a different (usually wider) band inside a UTC
   # time window — e.g. US regular hours, when premium noise roughly doubles.
   # Outside the window the global upper_bps/lower_bps apply. start > end wraps
@@ -117,6 +155,27 @@ execution:
   reconcile_sec: 15.0          # on-chain position sync cadence / 链上持仓核对周期
   venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
   http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+  #
+  # daily_max_loss_usd: realized+unrealized UTC-day drawdown that triggers
+  # flatten-both-legs (reduce-only) and halt. State survives restarts via
+  # <trades_file>_pnl.json. 0 = off.
+  # 日亏损断路器：当日（UTC）已实现+浮动亏损达到此值即双边 reduce-only 强平并
+  # 停机；日切状态存于 <trades_file>_pnl.json，重启不重置。0 = 关闭。
+  # daily_max_loss_usd: 0.60
+  #
+  # Band-decoupled exits: closing inventory does NOT wait for the entry band.
+  # Once |premium - midline| <= reversion_close_bps, or a position has been
+  # open longer than timeout_close_min, the unwind fires at a fee-only hurdle.
+  # 0 = off. 解耦出场：溢价回到中枢 ±bps 内、或持仓超时，即按"仅费"门槛
+  # 强制放行平仓（0 = 关闭）。
+  # reversion_close_bps: 1.0
+  # timeout_close_min: 240
+  #
+  # min_cross_rounds: refuse opens unless the crossable book depth clears at
+  # least N venue minimum orders (closes exempt) — thins books to 1-share
+  # fills you cannot hedge cleanly. 0 = off. 薄簿闸门：可穿深度不足 N 个
+  # 交易所最小单时拒绝开新仓（0 = 关闭）。
+  # min_cross_rounds: 2.0
 
 # ================== DATA RECORDER / 数据采集 ===============================
 # Always-on while the bot runs: samples both real order books 1/sec and
