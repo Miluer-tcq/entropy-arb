@@ -609,6 +609,13 @@ class Engine:
             if (cfg.reversion_close_bps > 0 and prem_now is not None
                     and abs(prem_now - mid_now) <= cfg.reversion_close_bps):
                 exit_close = True
+        # the trigger IS the exit policy; plan_arb's threshold is a RAW
+        # hurdle, so the only "threshold" consistent with trigger-to-close is
+        # an unconditional marketable one (slippage caps still bind). A
+        # fee-only 0.0 here was a 09-03 trap: with the midline at -10 bps it
+        # demanded a +10 bps reversion — harder than the band itself, and a
+        # long sat uncloseable for hours.
+        exit_thr = -1000.0 if exit_close else None
         exit_dkey = ("sell_entropy" if pos > 0 else "buy_entropy") \
             if exit_close else None
         for buy, sell, dkey in ((self.hedge, self.entropy, "sell_entropy"),
@@ -647,9 +654,16 @@ class Engine:
             if (buy.book.last_update_ts <= buy.last_traded_ts
                     or sell.book.last_update_ts <= sell.last_traded_ts):
                 continue
-            plan, reason = self._plan(
-                buy, sell, cfg.max_order_notional,
-                threshold_bps=0.0 if dkey == exit_dkey else None)
+            if dkey == exit_dkey:
+                # size a decoupled close by the inventory, not the book:
+                # never flip the position while forcing it out
+                ref = self.entropy.book.mid() or 0.0
+                cap = min(cfg.max_order_notional, abs(pos) * ref * 1.05)
+                plan, reason = self._plan(buy, sell, cap,
+                                          threshold_bps=exit_thr)
+            else:
+                plan, reason = self._plan(buy, sell,
+                                          cfg.max_order_notional)
             edge_present = reason not in ("no_edge", "empty_book")
             if not edge_present:
                 self._armed[dkey] = None
@@ -668,8 +682,9 @@ class Engine:
                               "min — skipped", dkey, plan.q_max_notional,
                               cfg.min_cross_rounds)
                 continue
-            if plan is not None and cfg.max_top_premium_bps > 0 \
-                    and plan.top_premium_bps > cfg.max_top_premium_bps:
+            if (plan is not None and dkey != exit_dkey
+                    and cfg.max_top_premium_bps > 0
+                    and plan.top_premium_bps > cfg.max_top_premium_bps):
                 # too fat to be real on a taker IOC: one side's book is
                 # lagging a fast move. If maker mode is on, rest a passive
                 # order on the LAGGING side and get paid to be right (only a
@@ -722,8 +737,15 @@ class Engine:
                 continue
             headroom = self._headroom(buy, sell, plan.buy_limit)
             if headroom < plan.buy_notional:
-                plan, _ = self._plan(buy, sell,
-                                     min(cfg.max_order_notional, headroom))
+                if dkey == exit_dkey:
+                    ref = self.entropy.book.mid() or 0.0
+                    rcap = min(cfg.max_order_notional,
+                               abs(pos) * ref * 1.05, headroom)
+                    plan, _ = self._plan(buy, sell, rcap,
+                                         threshold_bps=exit_thr)
+                else:
+                    plan, _ = self._plan(
+                        buy, sell, min(cfg.max_order_notional, headroom))
                 if plan is None or (not reducing and self._below_floor(plan)):
                     self._skiplog("%s blocked by position caps (headroom $%.0f)",
                                   dkey, max(headroom, 0.0))

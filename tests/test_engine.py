@@ -240,6 +240,36 @@ def test_reversion_close_fires_at_mid():
     assert run_scan(eng2) is None
 
 
+def test_decoupled_exit_ignores_negative_midline():
+    # 09-03 live: midline -10, a long opened near the lower band sat hours
+    # because the old exit used a 0 bps RAW fee hurdle — 10 bps HARDER than
+    # the band it was meant to replace. Trigger -> marketable close, period.
+    eng = make_engine(midline=-10.0, upper=3.0, lower=3.0)
+    eng.cfg.reversion_close_bps = 1.5
+    eng.cfg.timeout_close_min = 999.0
+    eng.entropy.position = 0.0197          # long entropy, delta-neutral pair
+    eng.hedge.position = -0.0197
+    eng._open_since = time.time() - 60.0   # timeout far away
+    eng.entropy.set_book(1538.2, 1538.3)   # premium ~ -10.5: inside band,
+    eng.hedge.set_book(1539.6, 1539.8)     #   0.5bps from the midline
+    best = run_scan(eng)
+    assert best is not None and best[1].key == "entropy"
+    # ... and it never flips: the plan may not size past the inventory
+    assert best[2].qty <= 0.0197 * 1.05 + 1e-9
+    # timeout path: 3 bps BELOW the midline (reversion window missed),
+    # age alone forces the market close
+    eng2 = make_engine(midline=-10.0, upper=3.0, lower=3.0)
+    eng2.cfg.reversion_close_bps = 1.5
+    eng2.cfg.timeout_close_min = 1.0
+    eng2.entropy.position = 0.0197
+    eng2.hedge.position = -0.0197
+    eng2._open_since = time.time() - 200.0
+    eng2.entropy.set_book(1535.0, 1535.1)  # premium ~ -13: far from mid
+    eng2.hedge.set_book(1536.9, 1537.2)
+    best2 = run_scan(eng2)
+    assert best2 is not None and best2[1].key == "entropy"
+
+
 def test_min_cross_rounds_blocks_thin_book_opens():
     # 0.10 base crossable ~= $10 = one minimum round: dust-tail churn bait
     eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
