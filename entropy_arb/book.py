@@ -57,6 +57,16 @@ class OrderBook:
         self.last_update_ts = time.time()
         self.touch()
 
+    # ---- Polymarket Perps full snapshot (list of [price, size] strings) ----
+    def apply_poly(self, levels: dict) -> None:
+        self.bids = {float(p): float(s)
+                     for p, s in levels.get("bids") or [] if float(s) > 0}
+        self.asks = {float(p): float(s)
+                     for p, s in levels.get("asks") or [] if float(s) > 0}
+        self.ready = True
+        self.last_update_ts = time.time()
+        self.touch()
+
     def sorted_bids(self) -> List[Level]:
         return sorted(self.bids.items(), key=lambda kv: -kv[0])
 

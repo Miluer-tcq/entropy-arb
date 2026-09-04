@@ -35,6 +35,7 @@ from .monitor import (auto_band_targets, drift_report, median,
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
+from .venue_poly import PolyVenue
 
 log = logging.getLogger("engine")
 
@@ -173,6 +174,9 @@ class Engine:
     def _make_venue(self, vc):
         if vc.kind == "lighter":
             return LighterVenue(vc, self.session, self.cfg.settle_timeout_sec)
+        if vc.kind == "poly":
+            return PolyVenue(vc, self.cfg.poly_api_url, self.cfg.poly_proxy,
+                             self.session, self.cfg.settle_timeout_sec)
         return HLVenue(vc, self.cfg.hl_api_url, self.cfg.hl_ws_url,
                        self.session, self.cfg.settle_timeout_sec)
 

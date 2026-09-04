@@ -1,0 +1,74 @@
+# entropy-arb — POLYMARKET PERPS recorder (phase 1: record-only)
+#
+# Polymarket listed stock perps (incl. SNDK-USD) in 2026 on a Polygon-
+# custodied CLOB. Taker fee 4 bps at base tier vs Lighter's 0 — this venue
+# is NOT tradable through this bot yet; the adapter physically refuses to
+# sign orders (venue_poly.TradeNotWired). Purpose: collect the same 1-minute
+# bars as the other recorders so tools/analyze.py + the backtester can
+# decide, on data, whether an Entropy<->Polymarket (or Lighter<->Polymarket)
+# pair clears its fee wall.
+#
+# The public REST book sits behind Cloudflare and is blocked on many
+# networks — .env needs POLY_PROXY (e.g. http://127.0.0.1:7897).
+#
+# Start:  python main.py --record-only --symbol SNDK --hedge polymarket \
+#             --config config-poly.yaml --no-dashboard
+
+# ============================ THE SIGNAL / 信号 ============================
+thresholds:
+  midline_bps: 0.0     # placeholder until recorded data measures it / 采集后测量
+  upper_bps: 4.0
+  lower_bps: 4.0
+
+# ======================== VENUES / 交易所参数 ==============================
+entropy:
+  dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
+  taker_fee_bps: 0.9         # live-measured io dex taker / 实测吃单费
+  fee_auto: false
+  max_position_usd: 1000
+  max_orders_per_min: 120
+
+hedge:
+  taker_fee_bps: 4.0         # Polymarket base-tier taker (0.04%) / 基础档吃单费
+  fee_auto: false            # tiers are behind auth; config value is the plan
+  max_position_usd: 1000
+  max_orders_per_min: 60
+
+# ========================= SIZING / 下单规模 ===============================
+sizing:
+  take_fraction: 0.5
+  max_order_notional_usd: 500
+  min_order_notional_usd: 10
+
+# ==================== INVENTORY LADDER / 库存阶梯 ==========================
+inventory:
+  scale_bps: 10.0
+  floor_frac: 0
+
+# ======================= EXECUTION / 执行参数 ==============================
+execution:
+  premium_persist_sec: 0
+  cooldown_sec: 0.0
+  settle_timeout_sec: 10.0
+  leg_slippage_bps: 50.0
+  hedge_slippage_bps: 20.0
+  net_tolerance_base: 0.001
+  max_consecutive_errors: 3
+  rate_limit_pause_sec: 10.0
+  staleness_sec: 10.0
+  reconcile_sec: 15.0
+  venue_probe_sec: 30.0
+  http_keepalive_sec: 0.0    # no order path to keep warm (record-only)
+
+# ================== DATA RECORDER / 数据采集 ===============================
+recorder:
+  enabled: true
+  csv: logs/poly_minutes.csv
+
+# ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
+logging:
+  level: INFO
+  status_interval_sec: 30.0
+  trades_csv: logs/poly_trades.csv
+  dashboard: true
+  file: logs/poly_engine.log

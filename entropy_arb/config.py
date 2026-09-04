@@ -30,9 +30,13 @@ import yaml
 from dotenv import load_dotenv
 
 HL_API_URL = "https://api.hyperliquid.xyz"
-HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
+HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+# https (not http): Cloudflare serves a 403 block page to a plain-http
+# forward through the proxy, but answers the CONNECT tunnel for https —
+# verified live. Retries absorb occasional Clash tunnel resets.
+POLY_API_URL = "https://api.perpetuals.polymarket.com"   # official ws — the only HL feed used
 
-HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
+HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz", "polymarket")
 
 
 @dataclass(frozen=True)
@@ -211,6 +215,8 @@ class Config:
     # runtime
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
+    poly_api_url: str = POLY_API_URL
+    poly_proxy: str = ""        # .env POLY_PROXY — Cloudflare egress helper
 
     @property
     def creds_complete(self) -> bool:
@@ -623,6 +629,18 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
                 _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS")),
         )
+    elif hedge_venue == "polymarket":
+        # record-only phase: 4 bps base-tier taker is far above Lighter's 0,
+        # so no fee_auto discovery and no credentials — the adapter refuses
+        # to sign, and the recorder decides whether it ever earns a wallet
+        hedge = VenueConf(
+            key="hedge", kind="poly", label="POLY",
+            symbol=symbol,
+            fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 4.0)),
+            fee_auto=False,
+            cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
+            orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 60)),
+        )
     else:
         hedge = VenueConf(
             key="hedge", kind="lighter",
@@ -688,6 +706,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         min_cross_rounds=float(_get(raw, "execution", "min_cross_rounds", 0.0)),
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
+        poly_proxy=_env_s("POLY_PROXY"),
         log_level=_validated_log_level(_get(raw, "logging", "level", "INFO")),
         status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),

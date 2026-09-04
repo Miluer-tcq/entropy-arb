@@ -155,6 +155,12 @@ class HLVenue:
                     self._info_penalty = min(max(self._info_penalty, 0.5)
                                              * 2.0, 15.0)
                     wait, err = 1.5, e
+                except (aiohttp.ClientConnectorError,
+                        aiohttp.ServerTimeoutError,
+                        asyncio.TimeoutError) as e:
+                    # sporadic TLS resets (a Clash/proxy or HL edge blip must
+                    # not kill a --record-only start): one retry, then raise
+                    wait, err = 1.5, e
             if wait:
                 await asyncio.sleep(wait)
         if err is not None:
