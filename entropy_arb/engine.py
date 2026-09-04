@@ -125,6 +125,7 @@ class Engine:
         self._day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._pnl_anchor = 0.0
         self._open_since: Optional[float] = None
+        self._open_prem: Optional[float] = None
         self._load_pnl_state()
 
     # ------------------------------------------------------------- utilities
@@ -601,8 +602,10 @@ class Engine:
         if abs(pos) > cfg.net_tolerance_base:
             if self._open_since is None:
                 self._open_since = now
+                self._open_prem = self.premium_bps()
         else:
             self._open_since = None
+            self._open_prem = None
         exit_close = False
         if abs(pos) > cfg.net_tolerance_base:
             mid_now = self._band()[0]
@@ -612,7 +615,17 @@ class Engine:
                 exit_close = True
             if (cfg.reversion_close_bps > 0 and prem_now is not None
                     and abs(prem_now - mid_now) <= cfg.reversion_close_bps):
-                exit_close = True
+                # 09-04 lesson: near-mid is NOT enough — the tuner walks the
+                # midline toward price, so a deep entry "reverts" seconds
+                # later at a capture smaller than fees + both crossings.
+                # A reversion close must prove the round trip is paid for:
+                # premium moved toward us from entry by >= RT fees + margin.
+                sgn = 1.0 if pos > 0 else -1.0
+                rt_fees = 2.0 * (self.entropy.fee_bps + self.hedge.fee_bps)
+                if (self._open_prem is None
+                        or (prem_now - self._open_prem) * sgn
+                        >= rt_fees + self._EXIT_CAPTURE_MARGIN_BPS):
+                    exit_close = True
         # the trigger IS the exit policy; plan_arb's threshold is a RAW
         # hurdle, so the only "threshold" consistent with trigger-to-close is
         # an unconditional marketable one (slippage caps still bind). A
@@ -1213,6 +1226,13 @@ class Engine:
             return None
         return (em / hm - 1.0) * 1e4
 
+    # margin a reversion close must earn ABOVE round-trip fees (bps) —
+    # absorbs both crossings' half-spreads plus plan->fill decay (09-04
+    # measured: a +10.5 planned entry filled at +5.2 — decay alone is ~5bps);
+    # without it the tuner chasing the midline lets a deep entry "revert"
+    # seconds later at a capture smaller than its own cost (the 11-second
+    # buy->sell -$0.014 churn of the 20:4x session)
+    _EXIT_CAPTURE_MARGIN_BPS = 3.0
     WATCH_INTERVAL_SEC = 60.0
 
     async def _watch_loop(self) -> None:

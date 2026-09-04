@@ -242,7 +242,7 @@ def test_reversion_close_fires_at_mid():
 
 def test_decoupled_exit_ignores_negative_midline():
     # 09-03 live: midline -10, a long opened near the lower band sat hours
-    # because the old exit used a 0 bps RAW fee hurdle — 10 bps HARDER than
+    # because the old exit used a 0 bps RAW hurdle — 10 bps HARDER than
     # the band it was meant to replace. Trigger -> marketable close, period.
     eng = make_engine(midline=-10.0, upper=3.0, lower=3.0)
     eng.cfg.reversion_close_bps = 1.5
@@ -250,6 +250,7 @@ def test_decoupled_exit_ignores_negative_midline():
     eng.entropy.position = 0.0197          # long entropy, delta-neutral pair
     eng.hedge.position = -0.0197
     eng._open_since = time.time() - 60.0   # timeout far away
+    eng._open_prem = -14.0                 # entered deep; now reverting
     eng.entropy.set_book(1538.2, 1538.3)   # premium ~ -10.5: inside band,
     eng.hedge.set_book(1539.6, 1539.8)     #   0.5bps from the midline
     best = run_scan(eng)
@@ -264,10 +265,31 @@ def test_decoupled_exit_ignores_negative_midline():
     eng2.entropy.position = 0.0197
     eng2.hedge.position = -0.0197
     eng2._open_since = time.time() - 200.0
+    eng2._open_prem = -14.0
     eng2.entropy.set_book(1535.0, 1535.1)  # premium ~ -13: far from mid
     eng2.hedge.set_book(1536.9, 1537.2)
     best2 = run_scan(eng2)
     assert best2 is not None and best2[1].key == "entropy"
+
+
+def test_reversion_close_never_churns_an_unpaid_round_trip():
+    # 09-04 live churn: bought at ~-10bps, 11s later premium wobbled to
+    # -9.5 (inside the reversion window) and the marketable close dumped the
+    # long at -$0.030 realized. A reversion close must earn RT fees + margin
+    # FROM ENTRY before it may fire; a wobble may not.
+    eng = make_engine(midline=-10.0, upper=3.0, lower=3.0)
+    eng.cfg.reversion_close_bps = 1.5
+    eng.cfg.timeout_close_min = 999.0
+    eng.entropy.position = 0.0197
+    eng.hedge.position = -0.0197
+    eng._open_since = time.time() - 11.0   # just entered
+    eng._open_prem = -10.6                 # entered barely under the mid
+    eng.entropy.set_book(1538.2, 1538.3)   # ~-10.4: within 1.5 of midline…
+    eng.hedge.set_book(1539.6, 1539.8)     # …capture only ~0.2 < fees+margin
+    assert run_scan(eng) is None           # so the close must NOT fire
+    # same books but a deep entry that has actually reverted: it fires
+    eng._open_prem = -14.0
+    assert run_scan(eng) is not None
 
 
 def test_min_cross_rounds_blocks_thin_book_opens():
