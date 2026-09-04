@@ -430,7 +430,11 @@ class Dashboard:
     def _trades_panel(self, max_rows: int = TRADE_ROWS):
         eng = self.eng
         rows = list(eng.recent_trades)[-max_rows:]
-        exp_sum = sum(r["exp"] for r in rows)
+        # maker-ladder rows carry exp/fill = None (planned edge has no $
+        # meaning when the entry leg rests passively) — skip them in sums,
+        # exactly like the fills list below
+        exps = [r["exp"] for r in rows if r["exp"] is not None]
+        exp_sum = sum(exps) if exps else None
         fills = [r["fill"] for r in rows if r["fill"] is not None]
         t = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1),
                   show_footer=bool(rows))

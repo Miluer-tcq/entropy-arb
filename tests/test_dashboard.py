@@ -137,6 +137,28 @@ def test_renders_record_only_and_empty_books():
     assert "render error" not in out
 
 
+def test_maker_rows_with_none_exp_do_not_crash():
+    # 09-04 live: every maker-ladder row logs exp=None (a rest has no
+    # planned-edge $) — the trades footer sum blew up on float + None and
+    # the whole dashboard red-panelled for the rest of the session
+    eng = make_engine()
+    eng.entropy.set_book(100.14, 100.16)
+    eng.hedge.set_book(99.99, 100.01)
+    eng.recent_trades.append({
+        "ts": time.time(), "direction": "buy_entropy/maker", "qty": 0.0626,
+        "notional": 99.0, "prem_bps": 19.0, "exp": None, "fill": None,
+        "status": "canceled/ioc_no_fill", "ok": False})
+    eng.recent_trades.append({
+        "ts": time.time(), "direction": "sell_entropy", "qty": 0.5,
+        "notional": 50.0, "prem_bps": 15.0, "exp": 0.07, "fill": 0.05,
+        "status": "filled/filled", "ok": True})
+    out = render(eng)
+    assert "render error" not in out
+    assert "buy_entropy/maker" in out
+    # the None row shows as em-dashes, the real row still totals
+    assert "canceled/ioc_no_fill" in out
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
